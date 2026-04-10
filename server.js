@@ -65,7 +65,7 @@ async function cleanup(...files) {
   }
 }
 
-// --- ffprobe helper ---
+// --- ffprobe helpers ---
 
 async function getDuration(filePath) {
   const { stdout } = await exec("ffprobe", [
@@ -75,6 +75,21 @@ async function getDuration(filePath) {
     filePath,
   ]);
   return parseFloat(stdout.trim());
+}
+
+async function hasAudioStream(filePath) {
+  try {
+    const { stdout } = await exec("ffprobe", [
+      "-v", "quiet",
+      "-select_streams", "a",
+      "-show_entries", "stream=codec_type",
+      "-of", "csv=p=0",
+      filePath,
+    ]);
+    return stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
 }
 
 // --- Auth middleware ---
@@ -166,15 +181,20 @@ app.post("/merge", auth, async (req, res) => {
     // Download all clips
     await Promise.all(clips.map((c, i) => download(c.url, clipFiles[i])));
 
-    // Normalize all clips to 24fps / 48000Hz
+    // Check if clips have audio
+    const firstHasAudio = await hasAudioStream(clipFiles[0]);
+
+    // Normalize all clips to 24fps (+ audio if present)
     const durations = [];
     for (let i = 0; i < clipFiles.length; i++) {
-      await exec("ffmpeg", [
-        "-y", "-i", clipFiles[i],
-        "-vf", "fps=24", "-af", "aresample=48000",
-        "-c:v", "libx264", "-c:a", "aac",
-        normFiles[i],
-      ]);
+      const normArgs = ["-y", "-i", clipFiles[i], "-vf", "fps=24"];
+      if (firstHasAudio) {
+        normArgs.push("-af", "aresample=48000", "-c:v", "libx264", "-c:a", "aac");
+      } else {
+        normArgs.push("-c:v", "libx264", "-an");
+      }
+      normArgs.push(normFiles[i]);
+      await exec("ffmpeg", normArgs);
       durations.push(await getDuration(normFiles[i]));
     }
 
@@ -195,26 +215,37 @@ app.post("/merge", auth, async (req, res) => {
       for (let i = 0; i < n - 1; i++) {
         const offset = durations.slice(0, i + 1).reduce((a, b) => a + b, 0) - TRANSITION * (i + 1);
         const vIn = i === 0 ? "[0:v][1:v]" : `[v${i - 1}][${i + 1}:v]`;
-        const aIn = i === 0 ? "[0:a][1:a]" : `[a${i - 1}][${i + 1}:a]`;
         const vOut = i === n - 2 ? "[v]" : `[v${i}]`;
-        const aOut = i === n - 2 ? "[a]" : `[a${i}]`;
 
         videoFilters.push(`${vIn}xfade=transition=fadeblack:duration=${TRANSITION}:offset=${offset.toFixed(3)}${vOut}`);
-        audioFilters.push(`${aIn}acrossfade=d=${TRANSITION}${aOut}`);
+
+        if (firstHasAudio) {
+          const aIn = i === 0 ? "[0:a][1:a]" : `[a${i - 1}][${i + 1}:a]`;
+          const aOut = i === n - 2 ? "[a]" : `[a${i}]`;
+          audioFilters.push(`${aIn}acrossfade=d=${TRANSITION}${aOut}`);
+        }
       }
 
       const filterComplex = [...videoFilters, ...audioFilters].join(";");
 
-      await exec("ffmpeg", [
+      const mergeArgs = [
         "-y",
         ...inputs,
         "-filter_complex", filterComplex,
-        "-map", "[v]", "-map", "[a]",
+        "-map", "[v]",
+      ];
+
+      if (firstHasAudio) {
+        mergeArgs.push("-map", "[a]", "-c:a", "aac", "-ar", "44100");
+      }
+
+      mergeArgs.push(
         "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
         "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
-        "-c:a", "aac", "-ar", "44100",
         outputFile,
-      ], { timeout: 120000 });
+      );
+
+      await exec("ffmpeg", mergeArgs, { timeout: 120000 });
     }
 
     const url = await uploadToR2(outputFile, output_key, "video/mp4");
