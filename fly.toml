@@ -1,4 +1,4 @@
-app = 'ffmpeg-service'
+app = 'app-icy-rain-1173'
 primary_region = 'cdg'
 
 [build]
