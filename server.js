@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
