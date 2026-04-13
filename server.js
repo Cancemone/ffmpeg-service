@@ -260,6 +260,50 @@ app.post("/merge", auth, async (req, res) => {
   }
 });
 
+// --- POST /still-to-clip ---
+// Convert a static image into a silent mp4 of exactly `duration_sec` length.
+// Output is 720x1280 (9:16) with black padding if the input has a different
+// aspect ratio, and is encoded with the same codec/profile/fps as /merge's
+// normalization step so the resulting clip xfades cleanly with Kling outputs.
+
+app.post("/still-to-clip", auth, async (req, res) => {
+  const { image_url, duration_sec, output_key } = req.body;
+  if (!image_url || !duration_sec || !output_key) {
+    return res.status(400).json({ error: "image_url, duration_sec, output_key required" });
+  }
+
+  const duration = Math.max(0.5, Math.min(60, Number(duration_sec)));
+  const imageFile = tmpPath(".img");
+  const outputFile = tmpPath(".mp4");
+
+  try {
+    await download(image_url, imageFile);
+
+    await exec("ffmpeg", [
+      "-y",
+      "-loop", "1",
+      "-i", imageFile,
+      "-t", String(duration),
+      "-vf",
+        "scale=720:1280:force_original_aspect_ratio=decrease," +
+        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black," +
+        "fps=24",
+      "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
+      "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
+      "-an",
+      outputFile,
+    ], { timeout: 60000 });
+
+    const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    const realDuration = await getDuration(outputFile);
+    res.json({ url, duration: realDuration, output_key });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    await cleanup(imageFile, outputFile);
+  }
+});
+
 // --- POST /burn-subs ---
 // Burn ASS subtitles into video
 
