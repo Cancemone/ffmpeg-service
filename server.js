@@ -40,8 +40,31 @@ function tmpPath(ext) {
 }
 
 async function download(url, dest) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download failed: ${res.status} ${url}`);
+  // Node 18+ fetch throws a generic "fetch failed" TypeError on network
+  // errors. The actual cause (DNS, ECONNREFUSED, EHOSTUNREACH, TLS, etc.)
+  // lives inside err.cause — unwrap it so the Next.js side gets a useful
+  // diagnostic instead of "fetch failed".
+  let res;
+  try {
+    res = await fetch(url, {
+      // Node fetch has no default timeout — a hung server would wedge the
+      // request forever. 60s is generous for R2/CDN downloads.
+      signal: AbortSignal.timeout(60_000),
+    });
+  } catch (err) {
+    const cause =
+      err?.cause?.code ||
+      err?.cause?.errno ||
+      err?.cause?.message ||
+      err?.message ||
+      "unknown";
+    const short = url.length > 120 ? url.slice(0, 120) + "…" : url;
+    throw new Error(`Network error fetching ${short}: ${cause}`);
+  }
+  if (!res.ok) {
+    const short = url.length > 120 ? url.slice(0, 120) + "…" : url;
+    throw new Error(`HTTP ${res.status} fetching ${short}`);
+  }
   const buf = Buffer.from(await res.arrayBuffer());
   await fsp.writeFile(dest, buf);
 }
