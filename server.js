@@ -190,10 +190,22 @@ app.post("/overlay", auth, async (req, res) => {
 // --- POST /merge ---
 // Merge N clips with fadeblack transitions
 
+// Hard ceiling matches Kling's 15s per-clip cap × a generous shot count.
+// 30 clips × 15s = ~7.5 min final, more than any real Facebook ad needs.
+const MAX_CLIPS_PER_MERGE = 30;
+
 app.post("/merge", auth, async (req, res) => {
   const { clips, output_key, transition_duration } = req.body;
   if (!clips || !Array.isArray(clips) || clips.length < 1 || !output_key) {
     return res.status(400).json({ error: "clips[] and output_key required" });
+  }
+  if (clips.length > MAX_CLIPS_PER_MERGE) {
+    return res.status(400).json({ error: `Too many clips (${clips.length}). Max ${MAX_CLIPS_PER_MERGE}.` });
+  }
+  for (let i = 0; i < clips.length; i++) {
+    if (!clips[i] || typeof clips[i].url !== "string" || !clips[i].url) {
+      return res.status(400).json({ error: `clips[${i}].url is required` });
+    }
   }
 
   const TRANSITION = transition_duration || 0.4;
