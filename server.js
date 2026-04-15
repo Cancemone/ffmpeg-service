@@ -13,7 +13,26 @@ const {
   PutObjectCommand,
 } = require("@aws-sdk/client-s3");
 
-const exec = promisify(execFile);
+const execRaw = promisify(execFile);
+
+// Hard per-invocation timeouts on child processes. Without these a single
+// wedged ffmpeg/ffprobe would hold CPU/RAM on the VPS indefinitely, long
+// after the Vercel caller has already timed out. killSignal: "SIGKILL"
+// because ffmpeg ignores SIGTERM in some codepaths.
+const FFPROBE_TIMEOUT_MS = 15_000;
+const FFMPEG_TIMEOUT_MS = 300_000; // 5 min — covers worst-case 30-clip merge
+
+function exec(cmd, args, opts = {}) {
+  const defaultTimeout =
+    cmd === "ffprobe" ? FFPROBE_TIMEOUT_MS : FFMPEG_TIMEOUT_MS;
+  return execRaw(cmd, args, {
+    timeout: defaultTimeout,
+    killSignal: "SIGKILL",
+    maxBuffer: 16 * 1024 * 1024,
+    ...opts,
+  });
+}
+
 const app = express();
 app.use(express.json());
 
@@ -284,7 +303,7 @@ app.post("/merge", auth, async (req, res) => {
         outputFile,
       );
 
-      await exec("ffmpeg", mergeArgs, { timeout: 120000 });
+      await exec("ffmpeg", mergeArgs);
     }
 
     const url = await uploadToR2(outputFile, output_key, "video/mp4");
@@ -330,7 +349,7 @@ app.post("/still-to-clip", auth, async (req, res) => {
       "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
       "-an",
       outputFile,
-    ], { timeout: 60000 });
+    ]);
 
     const url = await uploadToR2(outputFile, output_key, "video/mp4");
     const realDuration = await getDuration(outputFile);
@@ -450,7 +469,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
       "-c:a", "copy",
       outputFile,
-    ], { timeout: 120000 });
+    ]);
 
     const url = await uploadToR2(outputFile, output_key, "video/mp4");
     const duration = await getDuration(outputFile);
