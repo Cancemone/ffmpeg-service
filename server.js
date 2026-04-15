@@ -18,6 +18,10 @@ const app = express();
 app.use(express.json());
 
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
+if (!AUTH_TOKEN) {
+  console.error("FATAL: AUTH_TOKEN env var is required. Refusing to start.");
+  process.exit(1);
+}
 
 // --- R2 helpers ---
 
@@ -119,7 +123,6 @@ async function hasAudioStream(filePath) {
 // --- Auth middleware ---
 
 function auth(req, res, next) {
-  if (!AUTH_TOKEN) return next();
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (token !== AUTH_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   next();
