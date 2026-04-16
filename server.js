@@ -606,6 +606,69 @@ function toAssTime(s) {
   return `${h}:${String(m).padStart(2, "0")}:${sec.toFixed(2).padStart(5, "0")}`;
 }
 
+// --- POST /mix-background ---
+// Mix background music into a video at reduced volume (-18dB).
+// Music loops if shorter than video, fades out over the last 3s.
+
+app.post("/mix-background", auth, async (req, res) => {
+  const { video_url, music_url, output_key } = req.body;
+  if (!video_url || !music_url || !output_key) {
+    return res.status(400).json({ error: "video_url, music_url, output_key required" });
+  }
+
+  const videoFile = tmpPath(".mp4");
+  const musicFile = tmpPath(".mp3");
+  const outputFile = tmpPath(".mp4");
+
+  try {
+    await Promise.all([
+      download(video_url, videoFile),
+      download(music_url, musicFile),
+    ]);
+
+    const videoDuration = await getDuration(videoFile);
+
+    // Build audio filter:
+    // 1. Loop music, trim to video length
+    // 2. Reduce volume by 18dB
+    // 3. Fade out over last 3s
+    const fadeStart = Math.max(0, videoDuration - 3);
+    const musicFilter = `[1:a]aloop=loop=-1:size=2e+09,atrim=0:${videoDuration.toFixed(3)},volume=0.125,afade=t=out:st=${fadeStart.toFixed(3)}:d=3[bgm]`;
+
+    const hasAudio = await hasAudioStream(videoFile);
+
+    let filterComplex;
+    if (hasAudio) {
+      // Mix existing audio with background music
+      filterComplex = `${musicFilter};[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
+    } else {
+      // No existing audio — just use background music
+      filterComplex = `${musicFilter};[bgm]acopy[aout]`;
+    }
+
+    await exec("ffmpeg", [
+      "-i", videoFile,
+      "-i", musicFile,
+      "-filter_complex", filterComplex,
+      "-map", "0:v",
+      "-map", "[aout]",
+      "-c:v", "copy",
+      "-c:a", "aac",
+      "-b:a", "128k",
+      "-shortest",
+      "-y", outputFile,
+    ]);
+
+    const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    const duration = await getDuration(outputFile);
+    res.json({ url, duration, output_key });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    await cleanup(videoFile, musicFile, outputFile);
+  }
+});
+
 // --- Start ---
 
 const PORT = process.env.PORT || 3000;
