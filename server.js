@@ -362,15 +362,156 @@ app.post("/still-to-clip", auth, async (req, res) => {
 });
 
 // --- POST /burn-subs ---
-// Burn ASS subtitles into video
+// Burn styled ASS subtitles into video.
+//
+// Body: { video_url, output_key, style?, language?, words? }
+//
+// Supported styles:
+//   bold_outline — large white text, thick black outline (default / UGC standard)
+//   karaoke     — word-by-word yellow highlight on white text
+//   boxed       — white text on semi-transparent black box
+//   glowing     — white text with colored neon glow (pink)
+//   popup       — word-by-word scale-in animation
+//
+// If `words` is not provided, the endpoint auto-transcribes via Cloudflare
+// Whisper. `language` defaults to "fr".
+
+// ─── Subtitle style definitions ────────────────────────────────────────
+// Each style returns the [V4+ Styles] block and a function that formats
+// each dialogue line (some styles need per-word override tags).
+//
+// ASS color format: &HAABBGGRR (alpha, blue, green, red — reversed from RGB).
+// BorderStyle=1 = outline+shadow, BorderStyle=3 = opaque box behind text.
+
+const SUBTITLE_STYLE_DEFS = {
+  // Large white, thick black outline — the UGC/performance ad standard.
+  bold_outline: {
+    styleLine:
+      "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3.5,0,2,10,10,120,1",
+    formatDialogue(start, end, text) {
+      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
+    },
+  },
+
+  // Word-by-word highlight: white text, active word turns yellow.
+  // Uses ASS \\k (karaoke) tags with per-word durations.
+  karaoke: {
+    styleLine:
+      "Style: Default,Arial,48,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,10,10,120,1",
+    // Karaoke needs the raw word list, not pre-joined chunks.
+    // formatDialogue is called per-chunk but we override in buildAssContent.
+    formatDialogue(start, end, text) {
+      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
+    },
+  },
+
+  // White text on a semi-transparent black box. Maximum readability.
+  boxed: {
+    // BorderStyle=3 → opaque box. BackColour alpha controls box opacity.
+    styleLine:
+      "Style: Default,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,3,0,4,2,20,20,120,1",
+    formatDialogue(start, end, text) {
+      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
+    },
+  },
+
+  // White text with colored glow (pink neon). Uses blur + colored shadow.
+  glowing: {
+    styleLine:
+      "Style: Default,Arial,46,&H00FFFFFF,&H000000FF,&H00CC44FF,&H00CC44FF,1,0,0,0,100,100,0,0,1,2,3,2,10,10,120,1",
+    formatDialogue(start, end, text) {
+      // \\blur4 gives a soft glow around each letter
+      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,{\\blur4}${text}`;
+    },
+  },
+
+  // Word-by-word scale-in pop animation. Each word fades+scales in.
+  popup: {
+    styleLine:
+      "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,10,10,120,1",
+    formatDialogue(start, end, text) {
+      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
+    },
+  },
+};
+
+// Build the full ASS file content given a style key, word-level timing,
+// and a chunk size for grouping words into subtitle lines.
+function buildAssContent(styleKey, wordList) {
+  const def = SUBTITLE_STYLE_DEFS[styleKey] || SUBTITLE_STYLE_DEFS.bold_outline;
+
+  const header = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+${def.styleLine}
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+  const lines = [];
+
+  if (styleKey === "karaoke") {
+    // Karaoke: group 4 words per line, use \kf tags for smooth fill.
+    // \kf duration is in centiseconds.
+    const chunks = chunkWords(wordList, 4);
+    for (const chunk of chunks) {
+      const chunkStart = chunk[0].start;
+      const chunkEnd = chunk[chunk.length - 1].end;
+      const karaTags = chunk
+        .map((w) => {
+          const durCs = Math.round((w.end - w.start) * 100);
+          return `{\\kf${durCs}}${w.word}`;
+        })
+        .join(" ");
+      lines.push(
+        `Dialogue: 0,${toAssTime(chunkStart)},${toAssTime(chunkEnd)},Default,,0,0,0,,${karaTags}`
+      );
+    }
+  } else if (styleKey === "popup") {
+    // Pop-up: each word appears individually with a scale-in animation.
+    // \fscx0\fscy0 → \fscx100\fscy100 over 80ms = snappy pop.
+    for (const w of wordList) {
+      const animDur = 80; // ms
+      const tag = `{\\fscx0\\fscy0\\t(0,${animDur},\\fscx100\\fscy100)}`;
+      lines.push(
+        `Dialogue: 0,${toAssTime(w.start)},${toAssTime(w.end)},Default,,0,0,0,,${tag}${w.word}`
+      );
+    }
+  } else {
+    // All other styles: group 4 words per line, plain text.
+    const chunks = chunkWords(wordList, 4);
+    for (const chunk of chunks) {
+      const text = chunk.map((w) => w.word).join(" ");
+      lines.push(def.formatDialogue(chunk[0].start, chunk[chunk.length - 1].end, text));
+    }
+  }
+
+  return { content: header + lines.join("\n") + "\n", chunkCount: lines.length };
+}
+
+// Group word-level timing into N-word chunks for subtitle lines.
+function chunkWords(wordList, size) {
+  const chunks = [];
+  for (let i = 0; i < wordList.length; i += size) {
+    chunks.push(wordList.slice(i, i + size));
+  }
+  return chunks;
+}
 
 app.post("/burn-subs", auth, async (req, res) => {
-  const { video_url, words, output_key, language } = req.body;
+  const { video_url, words, output_key, language, style } = req.body;
 
   if (!video_url || !output_key) {
     return res.status(400).json({ error: "video_url and output_key required" });
   }
 
+  const styleKey = style && SUBTITLE_STYLE_DEFS[style] ? style : "bold_outline";
   const videoFile = tmpPath(".mp4");
   const assFile = tmpPath(".ass");
   const audioTmp = tmpPath(".mp3");
@@ -387,12 +528,10 @@ app.post("/burn-subs", auth, async (req, res) => {
       const apiToken = process.env.CLOUDFLARE_API_TOKEN;
 
       if (!accountId || !apiToken) {
-        // No Whisper credentials — return video as-is
         const url = await uploadToR2(videoFile, output_key, "video/mp4");
         return res.json({ url, output_key, subtitles: false });
       }
 
-      // Extract audio for Whisper
       await exec("ffmpeg", [
         "-y", "-i", videoFile,
         "-vn", "-ar", "16000", "-ac", "1", "-f", "mp3",
@@ -431,36 +570,9 @@ app.post("/burn-subs", auth, async (req, res) => {
       }
     }
 
-    // Build ASS subtitle file
-    const chunks = [];
-    for (let i = 0; i < wordList.length; i += 4) {
-      const group = wordList.slice(i, i + 4);
-      const text = group.map((w) => w.word).join(" ");
-      chunks.push({ start: group[0].start, end: group[group.length - 1].end, text });
-    }
-
-    const outlineColor = "&H000066FF";
-    let assContent = `[Script Info]
-ScriptType: v4.00+
-PlayResX: 720
-PlayResY: 1280
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,DejaVu Sans,42,&H00FFFFFF,&H000000FF,${outlineColor},&H00000000,1,0,0,0,100,100,0,0,1,2,0,2,10,10,140,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-`;
-
-    for (const { start, end, text } of chunks) {
-      assContent += `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}\n`;
-    }
-
+    const { content: assContent, chunkCount } = buildAssContent(styleKey, wordList);
     await fsp.writeFile(assFile, assContent, "utf-8");
 
-    // Burn subtitles into video
     await exec("ffmpeg", [
       "-y",
       "-i", videoFile,
@@ -474,9 +586,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const url = await uploadToR2(outputFile, output_key, "video/mp4");
     const duration = await getDuration(outputFile);
 
-    res.json({ url, duration, output_key, subtitles: true, chunks: chunks.length });
+    res.json({ url, duration, output_key, subtitles: true, style: styleKey, chunks: chunkCount });
   } catch (err) {
-    // Fallback: upload video without subs
     try {
       const url = await uploadToR2(videoFile, output_key, "video/mp4");
       res.json({ url, output_key, subtitles: false, reason: err.message });
