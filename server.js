@@ -399,7 +399,7 @@ const SUBTITLE_STYLE_DEFS = {
   // Large white, thick black outline — the UGC/performance ad standard.
   bold_outline: {
     styleLine:
-      "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3.5,0,2,10,10,120,1",
+      "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3.5,0,2,10,10,170,1",
     formatDialogue(start, end, text) {
       return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
     },
@@ -409,7 +409,7 @@ const SUBTITLE_STYLE_DEFS = {
   // Uses ASS \\k (karaoke) tags with per-word durations.
   karaoke: {
     styleLine:
-      "Style: Default,Arial,48,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,10,10,120,1",
+      "Style: Default,Arial,48,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,10,10,170,1",
     // Karaoke needs the raw word list, not pre-joined chunks.
     // formatDialogue is called per-chunk but we override in buildAssContent.
     formatDialogue(start, end, text) {
@@ -421,7 +421,7 @@ const SUBTITLE_STYLE_DEFS = {
   boxed: {
     // BorderStyle=3 → opaque box. BackColour alpha controls box opacity.
     styleLine:
-      "Style: Default,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,3,0,4,2,20,20,120,1",
+      "Style: Default,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,3,0,4,2,20,20,170,1",
     formatDialogue(start, end, text) {
       return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
     },
@@ -430,7 +430,7 @@ const SUBTITLE_STYLE_DEFS = {
   // White text with colored glow (pink neon). Uses blur + colored shadow.
   glowing: {
     styleLine:
-      "Style: Default,Arial,46,&H00FFFFFF,&H000000FF,&H00CC44FF,&H00CC44FF,1,0,0,0,100,100,0,0,1,2,3,2,10,10,120,1",
+      "Style: Default,Arial,46,&H00FFFFFF,&H000000FF,&H00CC44FF,&H00CC44FF,1,0,0,0,100,100,0,0,1,2,3,2,10,10,170,1",
     formatDialogue(start, end, text) {
       // \\blur4 gives a soft glow around each letter
       return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,{\\blur4}${text}`;
@@ -440,7 +440,7 @@ const SUBTITLE_STYLE_DEFS = {
   // Word-by-word scale-in pop animation. Each word fades+scales in.
   popup: {
     styleLine:
-      "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,10,10,120,1",
+      "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,10,10,170,1",
     formatDialogue(start, end, text) {
       return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
     },
