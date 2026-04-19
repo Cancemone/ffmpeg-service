@@ -124,6 +124,18 @@ async function getDuration(filePath) {
   return parseFloat(stdout.trim());
 }
 
+async function getVideoDimensions(filePath) {
+  const { stdout } = await exec("ffprobe", [
+    "-v", "quiet",
+    "-select_streams", "v:0",
+    "-show_entries", "stream=width,height",
+    "-of", "csv=p=0",
+    filePath,
+  ]);
+  const [w, h] = stdout.trim().split(",").map((n) => parseInt(n, 10));
+  return { width: w, height: h };
+}
+
 async function hasAudioStream(filePath) {
   try {
     const { stdout } = await exec("ffprobe", [
@@ -666,6 +678,49 @@ app.post("/mix-background", auth, async (req, res) => {
     res.status(500).json({ error: err.message });
   } finally {
     await cleanup(videoFile, musicFile, outputFile);
+  }
+});
+
+// --- POST /extract-thumbnail ---
+// Extract a single JPG frame at `timestamp_sec` (default 1s), upload to R2.
+// Returns thumbnail URL + source video width/height/duration so the caller
+// can derive aspect_ratio for creatives.
+
+app.post("/extract-thumbnail", auth, async (req, res) => {
+  const { video_url, output_key, timestamp_sec } = req.body;
+  if (!video_url || !output_key) {
+    return res.status(400).json({ error: "video_url, output_key required" });
+  }
+
+  const videoFile = tmpPath(".mp4");
+  const thumbFile = tmpPath(".jpg");
+
+  try {
+    await download(video_url, videoFile);
+
+    const [duration, dims] = await Promise.all([
+      getDuration(videoFile),
+      getVideoDimensions(videoFile),
+    ]);
+
+    // Clamp timestamp to well inside the clip so we never seek past EOF.
+    const ts = Math.min(Math.max(timestamp_sec ?? 1, 0), Math.max(0, duration - 0.1));
+
+    await exec("ffmpeg", [
+      "-y",
+      "-ss", String(ts),
+      "-i", videoFile,
+      "-frames:v", "1",
+      "-q:v", "3",
+      thumbFile,
+    ]);
+
+    const url = await uploadToR2(thumbFile, output_key, "image/jpeg");
+    res.json({ url, width: dims.width, height: dims.height, duration });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    await cleanup(videoFile, thumbFile);
   }
 });
 
