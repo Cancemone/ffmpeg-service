@@ -7,6 +7,8 @@ const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const dns = require("dns").promises;
+const net = require("net");
 const {
   S3Client,
   GetObjectCommand,
@@ -34,7 +36,9 @@ function exec(cmd, args, opts = {}) {
 }
 
 const app = express();
-app.use(express.json());
+// 64kb cap: biggest legitimate payload is /merge with up to 30 clip URLs plus
+// /burn-subs with a pre-transcribed word list. Both fit comfortably under this.
+app.use(express.json({ limit: "64kb" }));
 
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
 if (!AUTH_TOKEN) {
@@ -62,30 +66,161 @@ function tmpPath(ext) {
   return path.join(os.tmpdir(), `ff_${crypto.randomBytes(6).toString("hex")}${ext}`);
 }
 
-async function download(url, dest) {
-  // Node 18+ fetch throws a generic "fetch failed" TypeError on network
-  // errors. The actual cause (DNS, ECONNREFUSED, EHOSTUNREACH, TLS, etc.)
-  // lives inside err.cause — unwrap it so the Next.js side gets a useful
-  // diagnostic instead of "fetch failed".
-  let res;
+// --- SSRF protection ---
+//
+// `download()` fetches attacker-influenced URLs (creative video URLs, music
+// URLs, thumbnail sources). Without validation, a caller can point us at
+// cloud metadata (169.254.169.254), localhost services, or LAN hosts — the
+// body would then be uploaded to R2, making this an exfiltration channel.
+//
+// Defense:
+//   1. Scheme must be https (or http only if explicitly opted in via
+//      ALLOW_HTTP_DOWNLOADS=true for local dev).
+//   2. Optional hostname allowlist via ALLOWED_DOWNLOAD_HOSTS (comma-separated
+//      exact hosts or "*.suffix" patterns). If unset, any public hostname is
+//      accepted — the private-IP block below remains the safety net.
+//   3. DNS-resolve the hostname and reject loopback/private/link-local ranges
+//      for every resolved address.
+//   4. Redirects are handled manually so each hop is re-validated.
+
+const ALLOW_HTTP_DOWNLOADS = process.env.ALLOW_HTTP_DOWNLOADS === "true";
+const ALLOWED_DOWNLOAD_HOSTS = (process.env.ALLOWED_DOWNLOAD_HOSTS || "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+function isPrivateIp(addr) {
+  const family = net.isIP(addr);
+  if (family === 0) return true; // not a valid IP — treat as unsafe
+  if (family === 4) {
+    const parts = addr.split(".").map((n) => parseInt(n, 10));
+    const [a, b] = parts;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 0) return true;
+    if (a === 169 && b === 254) return true; // link-local incl. cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a >= 224) return true; // multicast + reserved
+    return false;
+  }
+  // IPv6
+  const lower = addr.toLowerCase();
+  if (lower === "::1" || lower === "::") return true;
+  if (lower.startsWith("fe80:") || lower.startsWith("fe90:")) return true; // link-local
+  if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA fc00::/7
+  if (lower.startsWith("::ffff:")) {
+    // IPv4-mapped — re-check the embedded v4 address
+    const v4 = lower.slice("::ffff:".length);
+    return isPrivateIp(v4);
+  }
+  return false;
+}
+
+function hostAllowed(hostname) {
+  if (ALLOWED_DOWNLOAD_HOSTS.length === 0) return true;
+  const h = hostname.toLowerCase();
+  for (const pattern of ALLOWED_DOWNLOAD_HOSTS) {
+    if (pattern.startsWith("*.")) {
+      const suffix = pattern.slice(1); // ".example.com"
+      if (h === suffix.slice(1) || h.endsWith(suffix)) return true;
+    } else if (h === pattern) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function assertSafeUrl(rawUrl) {
+  let parsed;
   try {
-    res = await fetch(url, {
-      // Node fetch has no default timeout — a hung server would wedge the
-      // request forever. 60s is generous for R2/CDN downloads.
-      signal: AbortSignal.timeout(60_000),
-    });
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("Invalid URL");
+  }
+  if (parsed.protocol !== "https:" && !(ALLOW_HTTP_DOWNLOADS && parsed.protocol === "http:")) {
+    throw new Error(`Unsupported URL scheme: ${parsed.protocol}`);
+  }
+  const hostname = parsed.hostname;
+  if (!hostname) throw new Error("URL has no hostname");
+  if (!hostAllowed(hostname)) {
+    throw new Error(`Hostname not allowed: ${hostname}`);
+  }
+  // If the hostname is already a literal IP, check it directly.
+  if (net.isIP(hostname)) {
+    if (isPrivateIp(hostname)) {
+      throw new Error(`Refusing to fetch private/loopback IP: ${hostname}`);
+    }
+    return;
+  }
+  // Otherwise resolve and verify every address.
+  let records;
+  try {
+    records = await dns.lookup(hostname, { all: true });
   } catch (err) {
-    const cause =
-      err?.cause?.code ||
-      err?.cause?.errno ||
-      err?.cause?.message ||
-      err?.message ||
-      "unknown";
-    const short = url.length > 120 ? url.slice(0, 120) + "…" : url;
-    throw new Error(`Network error fetching ${short}: ${cause}`);
+    throw new Error(`DNS lookup failed for ${hostname}: ${err.code || err.message}`);
+  }
+  for (const rec of records) {
+    if (isPrivateIp(rec.address)) {
+      throw new Error(
+        `Refusing to fetch ${hostname} — resolves to private/loopback ${rec.address}`
+      );
+    }
+  }
+}
+
+// --- output_key validation ---
+//
+// `output_key` is attacker-influenced and used verbatim as an R2 object key.
+// Without validation, a caller can overwrite any existing object (e.g.
+// already-published creative videos). Force a predictable shape so keys can
+// only land under expected prefixes and can only hold expected extensions.
+const OUTPUT_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9/_.\-]{0,199}\.(mp4|jpg|jpeg|png|webp)$/;
+
+function validateOutputKey(key) {
+  if (typeof key !== "string") return "output_key must be a string";
+  if (!OUTPUT_KEY_RE.test(key)) return "output_key has invalid shape";
+  if (key.includes("..")) return "output_key must not contain '..'";
+  if (key.startsWith("/")) return "output_key must not start with '/'";
+  return null;
+}
+
+const MAX_REDIRECTS = 3;
+
+async function download(url, dest) {
+  // Manual redirect loop so each hop is SSRF-validated (the auto-follow
+  // behaviour of `fetch` would happily chase a 302 → http://169.254.169.254).
+  let current = url;
+  let res;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    await assertSafeUrl(current);
+    try {
+      res = await fetch(current, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(60_000),
+      });
+    } catch (err) {
+      const cause =
+        err?.cause?.code ||
+        err?.cause?.errno ||
+        err?.cause?.message ||
+        err?.message ||
+        "unknown";
+      const short = current.length > 120 ? current.slice(0, 120) + "…" : current;
+      throw new Error(`Network error fetching ${short}: ${cause}`);
+    }
+    if (res.status >= 300 && res.status < 400) {
+      const next = res.headers.get("location");
+      if (!next) throw new Error(`Redirect ${res.status} without Location`);
+      // Resolve relative Location against current URL.
+      current = new URL(next, current).toString();
+      continue;
+    }
+    break;
   }
   if (!res.ok) {
-    const short = url.length > 120 ? url.slice(0, 120) + "…" : url;
+    const short = current.length > 120 ? current.slice(0, 120) + "…" : current;
     throw new Error(`HTTP ${res.status} fetching ${short}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
@@ -173,6 +308,8 @@ app.post("/overlay", auth, async (req, res) => {
   if (!video_url || !audio_url || !output_key) {
     return res.status(400).json({ error: "video_url, audio_url, output_key required" });
   }
+  const keyErr = validateOutputKey(output_key);
+  if (keyErr) return res.status(400).json({ error: keyErr });
 
   const videoFile = tmpPath(".mp4");
   const audioFile = tmpPath(".mp3");
@@ -241,6 +378,8 @@ app.post("/merge", auth, async (req, res) => {
       return res.status(400).json({ error: `clips[${i}].url is required` });
     }
   }
+  const mergeKeyErr = validateOutputKey(output_key);
+  if (mergeKeyErr) return res.status(400).json({ error: mergeKeyErr });
 
   const TRANSITION = transition_duration || 0.4;
   const clipFiles = clips.map(() => tmpPath(".mp4"));
@@ -259,7 +398,13 @@ app.post("/merge", auth, async (req, res) => {
     for (let i = 0; i < clipFiles.length; i++) {
       const normArgs = ["-y", "-i", clipFiles[i], "-vf", "fps=24"];
       if (firstHasAudio) {
-        normArgs.push("-af", "aresample=48000", "-c:v", "libx264", "-c:a", "aac");
+        // Force stereo + 48kHz so acrossfade never errors on mismatched
+        // channel layouts when one source clip is mono and another stereo.
+        normArgs.push(
+          "-af", "aformat=channel_layouts=stereo:sample_rates=48000",
+          "-ac", "2", "-ar", "48000",
+          "-c:v", "libx264", "-c:a", "aac",
+        );
       } else {
         normArgs.push("-c:v", "libx264", "-an");
       }
@@ -340,6 +485,8 @@ app.post("/still-to-clip", auth, async (req, res) => {
   if (!image_url || !duration_sec || !output_key) {
     return res.status(400).json({ error: "image_url, duration_sec, output_key required" });
   }
+  const keyErr = validateOutputKey(output_key);
+  if (keyErr) return res.status(400).json({ error: keyErr });
 
   const duration = Math.max(0.5, Math.min(60, Number(duration_sec)));
   const imageFile = tmpPath(".img");
@@ -522,12 +669,19 @@ app.post("/burn-subs", auth, async (req, res) => {
   if (!video_url || !output_key) {
     return res.status(400).json({ error: "video_url and output_key required" });
   }
+  const keyErr = validateOutputKey(output_key);
+  if (keyErr) return res.status(400).json({ error: keyErr });
 
   const styleKey = style && SUBTITLE_STYLE_DEFS[style] ? style : "bold_outline";
   const videoFile = tmpPath(".mp4");
   const assFile = tmpPath(".ass");
   const audioTmp = tmpPath(".mp3");
   const outputFile = tmpPath(".mp4");
+
+  // Guards the catch-block fallback: once the burned-subs output has been
+  // uploaded to R2, a later error must NOT re-upload the raw source video
+  // over it (which would clobber the good output with an un-subtitled one).
+  let uploadedFinal = false;
 
   try {
     await download(video_url, videoFile);
@@ -596,15 +750,23 @@ app.post("/burn-subs", auth, async (req, res) => {
     ]);
 
     const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    uploadedFinal = true;
     const duration = await getDuration(outputFile);
 
     res.json({ url, duration, output_key, subtitles: true, style: styleKey, chunks: chunkCount });
   } catch (err) {
-    try {
-      const url = await uploadToR2(videoFile, output_key, "video/mp4");
-      res.json({ url, output_key, subtitles: false, reason: err.message });
-    } catch (uploadErr) {
+    // Only fall back to raw-video upload if we never uploaded the burned-subs
+    // output. Otherwise a post-upload error (e.g. getDuration crash) would
+    // overwrite the good output with the un-subtitled source.
+    if (uploadedFinal) {
       res.status(500).json({ error: err.message });
+    } else {
+      try {
+        const url = await uploadToR2(videoFile, output_key, "video/mp4");
+        res.json({ url, output_key, subtitles: false, reason: err.message });
+      } catch {
+        res.status(500).json({ error: err.message });
+      }
     }
   } finally {
     await cleanup(videoFile, assFile, audioTmp, outputFile);
@@ -627,6 +789,8 @@ app.post("/mix-background", auth, async (req, res) => {
   if (!video_url || !music_url || !output_key) {
     return res.status(400).json({ error: "video_url, music_url, output_key required" });
   }
+  const keyErr = validateOutputKey(output_key);
+  if (keyErr) return res.status(400).json({ error: keyErr });
 
   const videoFile = tmpPath(".mp4");
   const musicFile = tmpPath(".mp3");
@@ -691,6 +855,8 @@ app.post("/extract-thumbnail", auth, async (req, res) => {
   if (!video_url || !output_key) {
     return res.status(400).json({ error: "video_url, output_key required" });
   }
+  const keyErr = validateOutputKey(output_key);
+  if (keyErr) return res.status(400).json({ error: keyErr });
 
   const videoFile = tmpPath(".mp4");
   const thumbFile = tmpPath(".jpg");
@@ -727,4 +893,10 @@ app.post("/extract-thumbnail", auth, async (req, res) => {
 // --- Start ---
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ffmpeg-service listening on :${PORT}`));
+// Default-bind to 127.0.0.1 so the service is not reachable from the public
+// internet. Front with nginx (TLS + IP allowlist of Vercel egress) on the
+// VPS. Override with LISTEN_HOST=0.0.0.0 only if you really need that.
+const HOST = process.env.LISTEN_HOST || "127.0.0.1";
+app.listen(PORT, HOST, () =>
+  console.log(`ffmpeg-service listening on ${HOST}:${PORT}`)
+);
