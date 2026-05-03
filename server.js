@@ -24,15 +24,25 @@ const execRaw = promisify(execFile);
 const FFPROBE_TIMEOUT_MS = 15_000;
 const FFMPEG_TIMEOUT_MS = 300_000; // 5 min — covers worst-case 30-clip merge
 
-function exec(cmd, args, opts = {}) {
+async function exec(cmd, args, opts = {}) {
   const defaultTimeout =
     cmd === "ffprobe" ? FFPROBE_TIMEOUT_MS : FFMPEG_TIMEOUT_MS;
-  return execRaw(cmd, args, {
-    timeout: defaultTimeout,
-    killSignal: "SIGKILL",
-    maxBuffer: 16 * 1024 * 1024,
-    ...opts,
-  });
+  try {
+    return await execRaw(cmd, args, {
+      timeout: defaultTimeout,
+      killSignal: "SIGKILL",
+      maxBuffer: 16 * 1024 * 1024,
+      ...opts,
+    });
+  } catch (err) {
+    // execFile's default Error.message is the command line, which truncates
+    // the actual ffmpeg/ffprobe diagnostic. Surface the tail of stderr so the
+    // caller sees why the filtergraph / codec / input failed.
+    const stderr = (err.stderr || "").toString();
+    const tail = stderr.slice(-1500).trim();
+    if (tail) err.message = `${cmd} failed: ${tail}`;
+    throw err;
+  }
 }
 
 const app = express();
@@ -390,18 +400,32 @@ app.post("/merge", auth, async (req, res) => {
     // Download all clips
     await Promise.all(clips.map((c, i) => download(c.url, clipFiles[i])));
 
-    // Check if clips have audio
-    const firstHasAudio = await hasAudioStream(clipFiles[0]);
+    // Check audio per clip. The pipeline mixes Kling clips (with VO) and
+    // /still-to-clip outputs (silent) freely, so we cannot assume the first
+    // clip's audio state applies to all. If ANY clip has audio, every clip
+    // is normalized to a stereo/48kHz track — silent ones get an anullsrc
+    // fill — so the acrossfade chain always finds [i:a] on every input.
+    const perClipAudio = await Promise.all(clipFiles.map(hasAudioStream));
+    const anyHasAudio = perClipAudio.some(Boolean);
 
-    // Normalize all clips to 24fps (+ audio if present)
     const durations = [];
     for (let i = 0; i < clipFiles.length; i++) {
-      const normArgs = ["-y", "-i", clipFiles[i], "-vf", "fps=24"];
-      if (firstHasAudio) {
-        // Force stereo + 48kHz so acrossfade never errors on mismatched
-        // channel layouts when one source clip is mono and another stereo.
+      const normArgs = ["-y", "-i", clipFiles[i]];
+      if (anyHasAudio && !perClipAudio[i]) {
+        // Inject silent stereo track so this clip carries audio through merge.
+        normArgs.push("-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000");
+      }
+      normArgs.push("-vf", "fps=24");
+      if (anyHasAudio) {
+        if (perClipAudio[i]) {
+          // Real audio — force stereo + 48kHz so acrossfade never errors on
+          // mismatched channel layouts when one clip is mono, another stereo.
+          normArgs.push("-af", "aformat=channel_layouts=stereo:sample_rates=48000");
+        }
         normArgs.push(
-          "-af", "aformat=channel_layouts=stereo:sample_rates=48000",
+          "-map", "0:v",
+          "-map", perClipAudio[i] ? "0:a" : "1:a",
+          "-shortest",
           "-ac", "2", "-ar", "48000",
           "-c:v", "libx264", "-c:a", "aac",
         );
@@ -434,7 +458,7 @@ app.post("/merge", auth, async (req, res) => {
 
         videoFilters.push(`${vIn}xfade=transition=fadeblack:duration=${TRANSITION}:offset=${offset.toFixed(3)}${vOut}`);
 
-        if (firstHasAudio) {
+        if (anyHasAudio) {
           const aIn = i === 0 ? "[0:a][1:a]" : `[a${i - 1}][${i + 1}:a]`;
           const aOut = i === n - 2 ? "[a]" : `[a${i}]`;
           audioFilters.push(`${aIn}acrossfade=d=${TRANSITION}${aOut}`);
@@ -450,7 +474,7 @@ app.post("/merge", auth, async (req, res) => {
         "-map", "[v]",
       ];
 
-      if (firstHasAudio) {
+      if (anyHasAudio) {
         mergeArgs.push("-map", "[a]", "-c:a", "aac", "-ar", "44100");
       }
 
