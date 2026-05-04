@@ -544,6 +544,46 @@ app.post("/still-to-clip", auth, async (req, res) => {
   }
 });
 
+// --- POST /extract-audio ---
+// Extract the audio track from a video into mp3, upload to R2, return URL.
+// Used by the Next.js side to feed kie.ai Scribe (STT) with an audio_url
+// — Scribe accepts only audio formats, not mp4. 22050 Hz mono @ 64 kbps
+// keeps file size small (a 60s clip ≈ 500 KB) while preserving enough
+// fidelity for accurate word-level transcription.
+//
+// Body: { video_url, output_key }
+// Response: { url, output_key }
+app.post("/extract-audio", auth, async (req, res) => {
+  const { video_url, output_key } = req.body;
+  if (!video_url || !output_key) {
+    return res.status(400).json({ error: "video_url and output_key required" });
+  }
+  const keyErr = validateOutputKey(output_key);
+  if (keyErr) return res.status(400).json({ error: keyErr });
+
+  const videoFile = tmpPath(".mp4");
+  const audioFile = tmpPath(".mp3");
+
+  try {
+    await download(video_url, videoFile);
+    await exec("ffmpeg", [
+      "-y", "-i", videoFile,
+      "-vn",
+      "-ar", "22050",
+      "-ac", "1",
+      "-b:a", "64k",
+      "-f", "mp3",
+      audioFile,
+    ]);
+    const url = await uploadToR2(audioFile, output_key, "audio/mpeg");
+    res.json({ url, output_key });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    await cleanup(videoFile, audioFile);
+  }
+});
+
 // --- POST /burn-subs ---
 // Burn styled ASS subtitles into video.
 //
