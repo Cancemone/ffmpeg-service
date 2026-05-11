@@ -759,7 +759,7 @@ app.post("/burn-subs", auth, async (req, res) => {
 
       if (!accountId || !apiToken) {
         const url = await uploadToR2(videoFile, output_key, "video/mp4");
-        return res.json({ url, output_key, subtitles: false });
+        return res.json({ url, output_key, subtitles: false, reason: "no_whisper_creds" });
       }
 
       await exec("ffmpeg", [
