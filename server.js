@@ -186,7 +186,7 @@ async function assertSafeUrl(rawUrl) {
 // Without validation, a caller can overwrite any existing object (e.g.
 // already-published creative videos). Force a predictable shape so keys can
 // only land under expected prefixes and can only hold expected extensions.
-const OUTPUT_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9/_.\-]{0,199}\.(mp4|jpg|jpeg|png|webp)$/;
+const OUTPUT_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9/_.\-]{0,199}\.(mp4|mp3|jpg|jpeg|png|webp)$/;
 
 function validateOutputKey(key) {
   if (typeof key !== "string") return "output_key must be a string";
