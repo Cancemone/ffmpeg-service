@@ -39,7 +39,7 @@ async function exec(cmd, args, opts = {}) {
     // the actual ffmpeg/ffprobe diagnostic. Surface the tail of stderr so the
     // caller sees why the filtergraph / codec / input failed.
     const stderr = (err.stderr || "").toString();
-    const tail = stderr.slice(-1500).trim();
+    const tail = stderr.slice(-6000).trim();
     if (tail) err.message = `${cmd} failed: ${tail}`;
     throw err;
   }
@@ -415,7 +415,16 @@ app.post("/merge", auth, async (req, res) => {
         // Inject silent stereo track so this clip carries audio through merge.
         normArgs.push("-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000");
       }
-      normArgs.push("-vf", "fps=24");
+      // Force identical geometry / SAR / pixel format / fps on every clip.
+      // xfade aborts on init if any of (width, height, format, SAR, timebase)
+      // differ between its two inputs — Kling outputs and /still-to-clip
+      // outputs used to disagree on SAR / pix_fmt even when both were 720x1280.
+      normArgs.push(
+        "-vf",
+        "scale=720:1280:force_original_aspect_ratio=decrease," +
+        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black," +
+        "setsar=1,format=yuv420p,fps=24",
+      );
       if (anyHasAudio) {
         if (perClipAudio[i]) {
           // Real audio — force stereo + 48kHz so acrossfade never errors on
@@ -427,10 +436,16 @@ app.post("/merge", auth, async (req, res) => {
           "-map", perClipAudio[i] ? "0:a" : "1:a",
           "-shortest",
           "-ac", "2", "-ar", "48000",
-          "-c:v", "libx264", "-c:a", "aac",
+          "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
+          "-pix_fmt", "yuv420p",
+          "-c:a", "aac",
         );
       } else {
-        normArgs.push("-c:v", "libx264", "-an");
+        normArgs.push(
+          "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
+          "-pix_fmt", "yuv420p",
+          "-an",
+        );
       }
       normArgs.push(normFiles[i]);
       await exec("ffmpeg", normArgs);
