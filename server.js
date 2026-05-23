@@ -351,9 +351,16 @@ app.post("/overlay", auth, async (req, res) => {
 
     await exec("ffmpeg", [
       "-y", "-i", videoFile, "-i", audioFinal,
+      // apad makes the audio stream infinite so a VO shorter than the
+      // clip is padded with silence instead of cutting the video. The
+      // output is then hard-bounded by -t to videoDur: relying on
+      // -shortest alone hangs forever against a -c:v copy stream on
+      // some ffmpeg builds (apad never EOFs, copy stream never trips
+      // -shortest), which previously ran until the 300s SIGKILL.
       "-filter_complex", "[1:a]apad[aout]",
       "-map", "0:v", "-map", "[aout]",
-      "-c:v", "copy", "-c:a", "aac", "-shortest",
+      "-c:v", "copy", "-c:a", "aac",
+      "-t", String(videoDur),
       outputFile,
     ]);
 
