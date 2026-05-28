@@ -339,7 +339,11 @@ app.post("/overlay", auth, async (req, res) => {
 
     let audioFinal = audioFile;
 
-    // Trim audio if longer than video (0.3s tolerance)
+    // Safety net: trim audio if longer than video (0.3s tolerance).
+    // After the 2026-05-28 TTS/VO rework, the Vercel-side bake guarantees
+    // audio ≤ video post-atempo before sending it here — this branch should
+    // not be hit in production runs. Kept defensively against legacy callers
+    // and to protect against a buggy atempo factor.
     if (audioDur > videoDur + 0.3) {
       await exec("ffmpeg", [
         "-y", "-i", audioFile,
@@ -928,6 +932,51 @@ app.post("/mix-background", auth, async (req, res) => {
     res.status(500).json({ error: err.message });
   } finally {
     await cleanup(videoFile, musicFile, outputFile);
+  }
+});
+
+// --- POST /atempo ---
+// Apply a single-pass ffmpeg atempo filter to an audio file.
+// Used by the Vercel-side bake pipeline to speed up VO that landed
+// slightly longer than the merged video duration. We cap on the caller
+// side at 1.25× (industry-standard transparent time-stretch ceiling);
+// here we accept ffmpeg's natural single-pass range [0.5, 2.0] so this
+// endpoint stays generic in case future callers need a wider band.
+//
+// Body: { audio_url, output_key, atempo }
+// Response: { url, duration, output_key, applied_atempo }
+app.post("/atempo", auth, async (req, res) => {
+  const { audio_url, output_key, atempo } = req.body;
+  if (!audio_url || !output_key || atempo === undefined) {
+    return res.status(400).json({ error: "audio_url, output_key, atempo required" });
+  }
+  const keyErr = validateOutputKey(output_key);
+  if (keyErr) return res.status(400).json({ error: keyErr });
+
+  const factor = Number(atempo);
+  if (!Number.isFinite(factor) || factor < 0.5 || factor > 2.0) {
+    return res.status(400).json({ error: "atempo must be a number in [0.5, 2.0]" });
+  }
+
+  const audioFile = tmpPath(".mp3");
+  const outputFile = tmpPath(".mp3");
+
+  try {
+    await download(audio_url, audioFile);
+    await exec("ffmpeg", [
+      "-y", "-i", audioFile,
+      "-filter:a", `atempo=${factor.toFixed(4)}`,
+      "-c:a", "libmp3lame",
+      "-b:a", "128k",
+      outputFile,
+    ]);
+    const url = await uploadToR2(outputFile, output_key, "audio/mpeg");
+    const duration = await getDuration(outputFile);
+    res.json({ url, duration, output_key, applied_atempo: factor });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    await cleanup(audioFile, outputFile);
   }
 });
 
