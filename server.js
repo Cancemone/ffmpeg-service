@@ -24,6 +24,32 @@ const execRaw = promisify(execFile);
 const FFPROBE_TIMEOUT_MS = 15_000;
 const FFMPEG_TIMEOUT_MS = 300_000; // 5 min — covers worst-case 30-clip merge
 
+// Strip ALL metadata from every video output we produce. `-map_metadata -1`
+// drops input-derived global/stream tags (title, comment, GPS, source
+// device); `-fflags +bitexact` stops the mp4 muxer from auto-stamping its
+// own `encoder` (Lavf…) + `creation_time` tags. Spliced in right before the
+// output file path of each video-producing ffmpeg call so whatever ends up
+// being the final delivered file is clean regardless of which stage produced
+// it. Meta re-encodes uploads and discards container metadata anyway — this
+// is delivery hygiene (no cross-creative fingerprint via tags), not a visual
+// change. Negligible cost: no extra pass, just output flags.
+const CLEAN_META = ["-map_metadata", "-1", "-fflags", "+bitexact"];
+
+// Color-grade presets → ffmpeg video filter chains. Keys mirror ColorGrade in
+// lib/flows/types.ts (minus 'none', which the caller never sends here). Kept
+// deliberately mild — these run on already-generated UGC, not raw footage, so
+// over-grading reads as fake. `eq` for contrast/saturation/gamma, optional
+// `colorbalance` for tone, light `unsharp` on punchy for that "shot on phone"
+// crispness.
+const COLOR_GRADE_FILTERS = {
+  warm_ugc:
+    "eq=contrast=1.06:saturation=1.10:gamma=1.02,colorbalance=rm=0.04:gm=0.01:bm=-0.05",
+  punchy:
+    "eq=contrast=1.16:saturation=1.22:brightness=0.02:gamma=0.98,unsharp=5:5:0.4:5:5:0.0",
+  cool_clean:
+    "eq=contrast=1.05:saturation=1.02:gamma=1.00,colorbalance=rm=-0.04:gm=0.00:bm=0.05",
+};
+
 async function exec(cmd, args, opts = {}) {
   const defaultTimeout =
     cmd === "ffprobe" ? FFPROBE_TIMEOUT_MS : FFMPEG_TIMEOUT_MS;
@@ -365,6 +391,7 @@ app.post("/overlay", auth, async (req, res) => {
       "-map", "0:v", "-map", "[aout]",
       "-c:v", "copy", "-c:a", "aac",
       "-t", String(videoDur),
+      ...CLEAN_META,
       outputFile,
     ]);
 
@@ -458,7 +485,7 @@ app.post("/merge", auth, async (req, res) => {
           "-an",
         );
       }
-      normArgs.push(normFiles[i]);
+      normArgs.push(...CLEAN_META, normFiles[i]);
       await exec("ffmpeg", normArgs);
       durations.push(await getDuration(normFiles[i]));
     }
@@ -507,6 +534,7 @@ app.post("/merge", auth, async (req, res) => {
       mergeArgs.push(
         "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
         "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
+        ...CLEAN_META,
         outputFile,
       );
 
@@ -557,6 +585,7 @@ app.post("/still-to-clip", auth, async (req, res) => {
       "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
       "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
       "-an",
+      ...CLEAN_META,
       outputFile,
     ]);
 
@@ -836,6 +865,7 @@ app.post("/burn-subs", auth, async (req, res) => {
       "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
       "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
       "-c:a", "copy",
+      ...CLEAN_META,
       outputFile,
     ]);
 
@@ -922,6 +952,7 @@ app.post("/mix-background", auth, async (req, res) => {
       "-c:a", "aac",
       "-b:a", "128k",
       "-shortest",
+      ...CLEAN_META,
       "-y", outputFile,
     ]);
 
@@ -932,6 +963,54 @@ app.post("/mix-background", auth, async (req, res) => {
     res.status(500).json({ error: err.message });
   } finally {
     await cleanup(videoFile, musicFile, outputFile);
+  }
+});
+
+// --- POST /color-grade ---
+// Apply a color-grade preset to a video (single re-encode). Audio is copied
+// through untouched. Body: { video_url, output_key, grade }
+// `grade` must be a known key in COLOR_GRADE_FILTERS ('none' is never sent —
+// the Vercel caller skips this endpoint entirely for 'none').
+// Response: { url, duration, output_key, grade }
+
+app.post("/color-grade", auth, async (req, res) => {
+  const { video_url, output_key, grade } = req.body;
+  if (!video_url || !output_key || !grade) {
+    return res.status(400).json({ error: "video_url, output_key, grade required" });
+  }
+  const keyErr = validateOutputKey(output_key);
+  if (keyErr) return res.status(400).json({ error: keyErr });
+
+  const vf = COLOR_GRADE_FILTERS[grade];
+  if (!vf) {
+    return res.status(400).json({
+      error: `Unknown grade '${grade}'. Expected one of: ${Object.keys(COLOR_GRADE_FILTERS).join(", ")}`,
+    });
+  }
+
+  const videoFile = tmpPath(".mp4");
+  const outputFile = tmpPath(".mp4");
+
+  try {
+    await download(video_url, videoFile);
+
+    await exec("ffmpeg", [
+      "-y", "-i", videoFile,
+      "-vf", vf,
+      "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
+      "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
+      "-c:a", "copy",
+      ...CLEAN_META,
+      outputFile,
+    ]);
+
+    const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    const duration = await getDuration(outputFile);
+    res.json({ url, duration, output_key, grade });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    await cleanup(videoFile, outputFile);
   }
 });
 
