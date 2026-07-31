@@ -108,10 +108,13 @@ function tmpPath(ext) {
 
 const {
   validateOutputKey,
+  parseDimensions,
+  scaleAndPadFilter,
   isPrivateIp,
   parseHostPatterns,
   hostAllowed,
 } = require("./validation");
+const { buildAssContent, STYLES } = require("./subtitles");
 
 const ALLOW_HTTP_DOWNLOADS = process.env.ALLOW_HTTP_DOWNLOADS === "true";
 const ALLOWED_DOWNLOAD_HOSTS = parseHostPatterns(process.env.ALLOWED_DOWNLOAD_HOSTS);
@@ -347,6 +350,9 @@ app.post("/merge", auth, async (req, res) => {
   const mergeKeyErr = validateOutputKey(output_key);
   if (mergeKeyErr) return res.status(400).json({ error: mergeKeyErr });
 
+  const dims = parseDimensions(req.body);
+  if (dims.error) return res.status(400).json({ error: dims.error });
+
   const TRANSITION = transition_duration || 0.4;
   const clipFiles = clips.map(() => tmpPath(".mp4"));
   const normFiles = clips.map(() => tmpPath(".mp4"));
@@ -375,12 +381,7 @@ app.post("/merge", auth, async (req, res) => {
       // xfade aborts on init if any of (width, height, format, SAR, timebase)
       // differ between its two inputs — Kling outputs and /still-to-clip
       // outputs used to disagree on SAR / pix_fmt even when both were 720x1280.
-      normArgs.push(
-        "-vf",
-        "scale=720:1280:force_original_aspect_ratio=decrease," +
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black," +
-        "setsar=1,format=yuv420p,fps=24",
-      );
+      normArgs.push("-vf", scaleAndPadFilter(dims.width, dims.height));
       if (anyHasAudio) {
         if (perClipAudio[i]) {
           // Real audio — force stereo + 48kHz so acrossfade never errors on
@@ -472,9 +473,11 @@ app.post("/merge", auth, async (req, res) => {
 
 // --- POST /still-to-clip ---
 // Convert a static image into a silent mp4 of exactly `duration_sec` length.
-// Output is 720x1280 (9:16) with black padding if the input has a different
-// aspect ratio, and is encoded with the same codec/profile/fps as /merge's
-// normalization step so the resulting clip xfades cleanly with Kling outputs.
+// Output is scaled/padded to the requested (or default 720x1280) dimensions
+// via the same scaleAndPadFilter chain /merge uses, so the resulting clip
+// xfades cleanly with Kling outputs (setsar=1/format=yuv420p included —
+// previously this endpoint omitted both, which is what made stills and Kling
+// clips disagree on SAR/pix_fmt at merge time).
 
 app.post("/still-to-clip", auth, async (req, res) => {
   const { image_url, duration_sec, output_key } = req.body;
@@ -483,6 +486,9 @@ app.post("/still-to-clip", auth, async (req, res) => {
   }
   const keyErr = validateOutputKey(output_key);
   if (keyErr) return res.status(400).json({ error: keyErr });
+
+  const dims = parseDimensions(req.body);
+  if (dims.error) return res.status(400).json({ error: dims.error });
 
   const duration = Math.max(0.5, Math.min(60, Number(duration_sec)));
   const imageFile = tmpPath(".img");
@@ -496,10 +502,7 @@ app.post("/still-to-clip", auth, async (req, res) => {
       "-loop", "1",
       "-i", imageFile,
       "-t", String(duration),
-      "-vf",
-        "scale=720:1280:force_original_aspect_ratio=decrease," +
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black," +
-        "fps=24",
+      "-vf", `${scaleAndPadFilter(dims.width, dims.height)}`,
       "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
       "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
       "-an",
@@ -572,134 +575,6 @@ app.post("/extract-audio", auth, async (req, res) => {
 // If `words` is not provided, the endpoint auto-transcribes via Cloudflare
 // Whisper. `language` defaults to "fr".
 
-// ─── Subtitle style definitions ────────────────────────────────────────
-// Each style returns the [V4+ Styles] block and a function that formats
-// each dialogue line (some styles need per-word override tags).
-//
-// ASS color format: &HAABBGGRR (alpha, blue, green, red — reversed from RGB).
-// BorderStyle=1 = outline+shadow, BorderStyle=3 = opaque box behind text.
-
-const SUBTITLE_STYLE_DEFS = {
-  // Large white, thick black outline — the UGC/performance ad standard.
-  bold_outline: {
-    styleLine:
-      "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3.5,0,2,10,10,170,1",
-    formatDialogue(start, end, text) {
-      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
-    },
-  },
-
-  // Word-by-word highlight: white text, active word turns yellow.
-  // Uses ASS \\k (karaoke) tags with per-word durations.
-  karaoke: {
-    styleLine:
-      "Style: Default,Arial,48,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,10,10,170,1",
-    // Karaoke needs the raw word list, not pre-joined chunks.
-    // formatDialogue is called per-chunk but we override in buildAssContent.
-    formatDialogue(start, end, text) {
-      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
-    },
-  },
-
-  // White text on a semi-transparent black box. Maximum readability.
-  boxed: {
-    // BorderStyle=3 → opaque box. BackColour alpha controls box opacity.
-    styleLine:
-      "Style: Default,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,3,0,4,2,20,20,170,1",
-    formatDialogue(start, end, text) {
-      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
-    },
-  },
-
-  // White text with colored glow (pink neon). Uses blur + colored shadow.
-  glowing: {
-    styleLine:
-      "Style: Default,Arial,46,&H00FFFFFF,&H000000FF,&H00CC44FF,&H00CC44FF,1,0,0,0,100,100,0,0,1,2,3,2,10,10,170,1",
-    formatDialogue(start, end, text) {
-      // \\blur4 gives a soft glow around each letter
-      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,{\\blur4}${text}`;
-    },
-  },
-
-  // Word-by-word scale-in pop animation. Each word fades+scales in.
-  popup: {
-    styleLine:
-      "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,10,10,170,1",
-    formatDialogue(start, end, text) {
-      return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`;
-    },
-  },
-};
-
-// Build the full ASS file content given a style key, word-level timing,
-// and a chunk size for grouping words into subtitle lines.
-function buildAssContent(styleKey, wordList) {
-  const def = SUBTITLE_STYLE_DEFS[styleKey] || SUBTITLE_STYLE_DEFS.bold_outline;
-
-  const header = `[Script Info]
-ScriptType: v4.00+
-PlayResX: 720
-PlayResY: 1280
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-${def.styleLine}
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-`;
-
-  const lines = [];
-
-  if (styleKey === "karaoke") {
-    // Karaoke: group 4 words per line, use \kf tags for smooth fill.
-    // \kf duration is in centiseconds.
-    const chunks = chunkWords(wordList, 4);
-    for (const chunk of chunks) {
-      const chunkStart = chunk[0].start;
-      const chunkEnd = chunk[chunk.length - 1].end;
-      const karaTags = chunk
-        .map((w) => {
-          const durCs = Math.round((w.end - w.start) * 100);
-          return `{\\kf${durCs}}${w.word}`;
-        })
-        .join(" ");
-      lines.push(
-        `Dialogue: 0,${toAssTime(chunkStart)},${toAssTime(chunkEnd)},Default,,0,0,0,,${karaTags}`
-      );
-    }
-  } else if (styleKey === "popup") {
-    // Pop-up: each word appears individually with a scale-in animation.
-    // \fscx0\fscy0 → \fscx100\fscy100 over 80ms = snappy pop.
-    for (const w of wordList) {
-      const animDur = 80; // ms
-      const tag = `{\\fscx0\\fscy0\\t(0,${animDur},\\fscx100\\fscy100)}`;
-      lines.push(
-        `Dialogue: 0,${toAssTime(w.start)},${toAssTime(w.end)},Default,,0,0,0,,${tag}${w.word}`
-      );
-    }
-  } else {
-    // All other styles: group 4 words per line, plain text.
-    const chunks = chunkWords(wordList, 4);
-    for (const chunk of chunks) {
-      const text = chunk.map((w) => w.word).join(" ");
-      lines.push(def.formatDialogue(chunk[0].start, chunk[chunk.length - 1].end, text));
-    }
-  }
-
-  return { content: header + lines.join("\n") + "\n", chunkCount: lines.length };
-}
-
-// Group word-level timing into N-word chunks for subtitle lines.
-function chunkWords(wordList, size) {
-  const chunks = [];
-  for (let i = 0; i < wordList.length; i += size) {
-    chunks.push(wordList.slice(i, i + size));
-  }
-  return chunks;
-}
-
 app.post("/burn-subs", auth, async (req, res) => {
   const { video_url, words, output_key, language, style } = req.body;
 
@@ -709,7 +584,7 @@ app.post("/burn-subs", auth, async (req, res) => {
   const keyErr = validateOutputKey(output_key);
   if (keyErr) return res.status(400).json({ error: keyErr });
 
-  const styleKey = style && SUBTITLE_STYLE_DEFS[style] ? style : "bold_outline";
+  const styleKey = style && STYLES[style] ? style : "bold_outline";
   const videoFile = tmpPath(".mp4");
   const assFile = tmpPath(".ass");
   const audioTmp = tmpPath(".mp3");
@@ -773,7 +648,8 @@ app.post("/burn-subs", auth, async (req, res) => {
       }
     }
 
-    const { content: assContent, chunkCount } = buildAssContent(styleKey, wordList);
+    const dims = await getVideoDimensions(videoFile);
+    const { content: assContent, chunkCount } = buildAssContent(styleKey, wordList, dims);
     await fsp.writeFile(assFile, assContent, "utf-8");
 
     await exec("ffmpeg", [
@@ -810,13 +686,6 @@ app.post("/burn-subs", auth, async (req, res) => {
     await cleanup(videoFile, assFile, audioTmp, outputFile);
   }
 });
-
-function toAssTime(s) {
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return `${h}:${String(m).padStart(2, "0")}:${sec.toFixed(2).padStart(5, "0")}`;
-}
 
 // --- POST /mix-background ---
 // Mix background music into a video at reduced volume (-18dB).

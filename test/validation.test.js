@@ -53,3 +53,34 @@ test("hostAllowed matches exact hosts and wildcard suffixes", () => {
   assert.equal(hostAllowed("klingai.com", patterns), true);
   assert.equal(hostAllowed("evil.example.com", patterns), false);
 });
+
+const { parseDimensions, scaleAndPadFilter } = require("../validation");
+
+test("parseDimensions defaults to 720x1280 when the caller sends nothing", () => {
+  assert.deepEqual(parseDimensions({}), { width: 720, height: 1280 });
+});
+
+test("parseDimensions accepts explicit even dimensions in range", () => {
+  assert.deepEqual(parseDimensions({ width: 1080, height: 1080 }), { width: 1080, height: 1080 });
+  assert.deepEqual(parseDimensions({ width: 1280, height: 720 }), { width: 1280, height: 720 });
+});
+
+test("parseDimensions rejects odd, out-of-range and non-numeric values", () => {
+  assert.match(parseDimensions({ width: 721, height: 1280 }).error, /even/);
+  assert.match(parseDimensions({ width: 100, height: 1280 }).error, /between/);
+  assert.match(parseDimensions({ width: 4000, height: 1280 }).error, /between/);
+  assert.match(parseDimensions({ width: "wide", height: 1280 }).error, /number/);
+});
+
+test("parseDimensions requires both values or neither", () => {
+  assert.match(parseDimensions({ width: 1080 }).error, /both/);
+});
+
+test("scaleAndPadFilter builds the canonical normalisation chain", () => {
+  assert.equal(
+    scaleAndPadFilter(720, 1280),
+    "scale=720:1280:force_original_aspect_ratio=decrease," +
+      "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black," +
+      "setsar=1,format=yuv420p,fps=24",
+  );
+});

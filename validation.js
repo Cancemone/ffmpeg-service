@@ -67,10 +67,55 @@ function hostAllowed(hostname, patterns) {
   return false;
 }
 
+// Output geometry. Defaults preserve the pre-format behaviour (9:16 at
+// 720x1280) for any caller that does not send dimensions yet.
+const DEFAULT_WIDTH = 720;
+const DEFAULT_HEIGHT = 1280;
+const MIN_DIMENSION = 256;
+const MAX_DIMENSION = 2160;
+
+function parseDimensions(body) {
+  const { width, height } = body || {};
+  if (width === undefined && height === undefined) {
+    return { width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT };
+  }
+  if (width === undefined || height === undefined) {
+    return { error: "width and height must be sent both or neither" };
+  }
+  for (const [name, value] of [["width", width], ["height", height]]) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return { error: `${name} must be a number` };
+    }
+    if (!Number.isInteger(value) || value % 2 !== 0) {
+      return { error: `${name} must be an even integer (libx264 yuv420p requirement)` };
+    }
+    if (value < MIN_DIMENSION || value > MAX_DIMENSION) {
+      return { error: `${name} must be between ${MIN_DIMENSION} and ${MAX_DIMENSION}` };
+    }
+  }
+  return { width, height };
+}
+
+// Canonical geometry normalisation. xfade aborts at init if any of
+// (width, height, pixel format, SAR, timebase) differ between its two inputs,
+// and Kling outputs disagree with /still-to-clip outputs on SAR / pix_fmt even
+// at identical resolutions — so every clip goes through this exact chain.
+function scaleAndPadFilter(width, height) {
+  return (
+    `scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+    `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,` +
+    "setsar=1,format=yuv420p,fps=24"
+  );
+}
+
 module.exports = {
   OUTPUT_KEY_RE,
   validateOutputKey,
   isPrivateIp,
   parseHostPatterns,
   hostAllowed,
+  parseDimensions,
+  scaleAndPadFilter,
+  DEFAULT_WIDTH,
+  DEFAULT_HEIGHT,
 };
