@@ -119,54 +119,15 @@ function tmpPath(ext) {
 //      for every resolved address.
 //   4. Redirects are handled manually so each hop is re-validated.
 
+const {
+  validateOutputKey,
+  isPrivateIp,
+  parseHostPatterns,
+  hostAllowed,
+} = require("./validation");
+
 const ALLOW_HTTP_DOWNLOADS = process.env.ALLOW_HTTP_DOWNLOADS === "true";
-const ALLOWED_DOWNLOAD_HOSTS = (process.env.ALLOWED_DOWNLOAD_HOSTS || "")
-  .split(",")
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
-
-function isPrivateIp(addr) {
-  const family = net.isIP(addr);
-  if (family === 0) return true; // not a valid IP — treat as unsafe
-  if (family === 4) {
-    const parts = addr.split(".").map((n) => parseInt(n, 10));
-    const [a, b] = parts;
-    if (a === 10) return true;
-    if (a === 127) return true;
-    if (a === 0) return true;
-    if (a === 169 && b === 254) return true; // link-local incl. cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-    if (a >= 224) return true; // multicast + reserved
-    return false;
-  }
-  // IPv6
-  const lower = addr.toLowerCase();
-  if (lower === "::1" || lower === "::") return true;
-  if (lower.startsWith("fe80:") || lower.startsWith("fe90:")) return true; // link-local
-  if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA fc00::/7
-  if (lower.startsWith("::ffff:")) {
-    // IPv4-mapped — re-check the embedded v4 address
-    const v4 = lower.slice("::ffff:".length);
-    return isPrivateIp(v4);
-  }
-  return false;
-}
-
-function hostAllowed(hostname) {
-  if (ALLOWED_DOWNLOAD_HOSTS.length === 0) return true;
-  const h = hostname.toLowerCase();
-  for (const pattern of ALLOWED_DOWNLOAD_HOSTS) {
-    if (pattern.startsWith("*.")) {
-      const suffix = pattern.slice(1); // ".example.com"
-      if (h === suffix.slice(1) || h.endsWith(suffix)) return true;
-    } else if (h === pattern) {
-      return true;
-    }
-  }
-  return false;
-}
+const ALLOWED_DOWNLOAD_HOSTS = parseHostPatterns(process.env.ALLOWED_DOWNLOAD_HOSTS);
 
 async function assertSafeUrl(rawUrl) {
   let parsed;
@@ -180,7 +141,7 @@ async function assertSafeUrl(rawUrl) {
   }
   const hostname = parsed.hostname;
   if (!hostname) throw new Error("URL has no hostname");
-  if (!hostAllowed(hostname)) {
+  if (!hostAllowed(hostname, ALLOWED_DOWNLOAD_HOSTS)) {
     throw new Error(`Hostname not allowed: ${hostname}`);
   }
   // If the hostname is already a literal IP, check it directly.
@@ -204,22 +165,6 @@ async function assertSafeUrl(rawUrl) {
       );
     }
   }
-}
-
-// --- output_key validation ---
-//
-// `output_key` is attacker-influenced and used verbatim as an R2 object key.
-// Without validation, a caller can overwrite any existing object (e.g.
-// already-published creative videos). Force a predictable shape so keys can
-// only land under expected prefixes and can only hold expected extensions.
-const OUTPUT_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9/_.\-]{0,199}\.(mp4|mp3|jpg|jpeg|png|webp)$/;
-
-function validateOutputKey(key) {
-  if (typeof key !== "string") return "output_key must be a string";
-  if (!OUTPUT_KEY_RE.test(key)) return "output_key has invalid shape";
-  if (key.includes("..")) return "output_key must not contain '..'";
-  if (key.startsWith("/")) return "output_key must not start with '/'";
-  return null;
 }
 
 const MAX_REDIRECTS = 3;
