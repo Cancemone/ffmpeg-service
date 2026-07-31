@@ -9,11 +9,7 @@ const os = require("os");
 const crypto = require("crypto");
 const dns = require("dns").promises;
 const net = require("net");
-const {
-  S3Client,
-  GetObjectCommand,
-  PutObjectCommand,
-} = require("@aws-sdk/client-s3");
+const { assertStorageEnv, uploadFile } = require("./storage");
 
 const execRaw = promisify(execFile);
 
@@ -82,21 +78,12 @@ if (!AUTH_TOKEN) {
   process.exit(1);
 }
 
-// --- R2 helpers ---
-
-function getR2() {
-  return new S3Client({
-    region: "auto",
-    endpoint: process.env.R2_ENDPOINT,
-    credentials: {
-      accessKeyId: process.env.R2_ACCESS_KEY_ID,
-      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-    },
-  });
+try {
+  assertStorageEnv();
+} catch (err) {
+  console.error(`FATAL: ${err.message}. Refusing to start.`);
+  process.exit(1);
 }
-
-const BUCKET = process.env.R2_BUCKET || "ugc-video";
-const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;
 
 function tmpPath(ext) {
   return path.join(os.tmpdir(), `ff_${crypto.randomBytes(6).toString("hex")}${ext}`);
@@ -107,7 +94,7 @@ function tmpPath(ext) {
 // `download()` fetches attacker-influenced URLs (creative video URLs, music
 // URLs, thumbnail sources). Without validation, a caller can point us at
 // cloud metadata (169.254.169.254), localhost services, or LAN hosts — the
-// body would then be uploaded to R2, making this an exfiltration channel.
+// body would then be uploaded to storage, making this an exfiltration channel.
 //
 // Defense:
 //   1. Scheme must be https (or http only if explicitly opted in via
@@ -206,20 +193,6 @@ async function download(url, dest) {
   }
   const buf = Buffer.from(await res.arrayBuffer());
   await fsp.writeFile(dest, buf);
-}
-
-async function uploadToR2(localPath, key, contentType) {
-  const r2 = getR2();
-  const body = await fsp.readFile(localPath);
-  await r2.send(
-    new PutObjectCommand({
-      Bucket: BUCKET,
-      Key: key,
-      Body: body,
-      ContentType: contentType || "video/mp4",
-    })
-  );
-  return `${R2_PUBLIC_URL}/${key}`;
 }
 
 async function cleanup(...files) {
@@ -340,7 +313,7 @@ app.post("/overlay", auth, async (req, res) => {
       outputFile,
     ]);
 
-    const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    const url = await uploadFile(outputFile, output_key, "video/mp4");
     const duration = await getDuration(outputFile);
 
     res.json({ url, duration, output_key });
@@ -486,7 +459,7 @@ app.post("/merge", auth, async (req, res) => {
       await exec("ffmpeg", mergeArgs);
     }
 
-    const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    const url = await uploadFile(outputFile, output_key, "video/mp4");
     const duration = await getDuration(outputFile);
 
     res.json({ url, duration, output_key });
@@ -534,7 +507,7 @@ app.post("/still-to-clip", auth, async (req, res) => {
       outputFile,
     ]);
 
-    const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    const url = await uploadFile(outputFile, output_key, "video/mp4");
     const realDuration = await getDuration(outputFile);
     res.json({ url, duration: realDuration, output_key });
   } catch (err) {
@@ -545,7 +518,7 @@ app.post("/still-to-clip", auth, async (req, res) => {
 });
 
 // --- POST /extract-audio ---
-// Extract the audio track from a video into mp3, upload to R2, return URL.
+// Extract the audio track from a video into mp3, upload to storage, return URL.
 // Used by the Next.js side to feed kie.ai Scribe (STT) with an audio_url
 // — Scribe accepts only audio formats, not mp4. 22050 Hz mono @ 64 kbps
 // keeps file size small (a 60s clip ≈ 500 KB) while preserving enough
@@ -575,7 +548,7 @@ app.post("/extract-audio", auth, async (req, res) => {
       "-f", "mp3",
       audioFile,
     ]);
-    const url = await uploadToR2(audioFile, output_key, "audio/mpeg");
+    const url = await uploadFile(audioFile, output_key, "audio/mpeg");
     res.json({ url, output_key });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -743,7 +716,7 @@ app.post("/burn-subs", auth, async (req, res) => {
   const outputFile = tmpPath(".mp4");
 
   // Guards the catch-block fallback: once the burned-subs output has been
-  // uploaded to R2, a later error must NOT re-upload the raw source video
+  // uploaded to storage, a later error must NOT re-upload the raw source video
   // over it (which would clobber the good output with an un-subtitled one).
   let uploadedFinal = false;
 
@@ -758,7 +731,7 @@ app.post("/burn-subs", auth, async (req, res) => {
       const apiToken = process.env.CLOUDFLARE_API_TOKEN;
 
       if (!accountId || !apiToken) {
-        const url = await uploadToR2(videoFile, output_key, "video/mp4");
+        const url = await uploadFile(videoFile, output_key, "video/mp4");
         return res.json({ url, output_key, subtitles: false, reason: "no_whisper_creds" });
       }
 
@@ -787,7 +760,7 @@ app.post("/burn-subs", auth, async (req, res) => {
       );
 
       if (!whisperRes.ok) {
-        const url = await uploadToR2(videoFile, output_key, "video/mp4");
+        const url = await uploadFile(videoFile, output_key, "video/mp4");
         return res.json({ url, output_key, subtitles: false, reason: "whisper_failed" });
       }
 
@@ -795,7 +768,7 @@ app.post("/burn-subs", auth, async (req, res) => {
       wordList = whisperData.result?.words;
 
       if (!wordList || wordList.length === 0) {
-        const url = await uploadToR2(videoFile, output_key, "video/mp4");
+        const url = await uploadFile(videoFile, output_key, "video/mp4");
         return res.json({ url, output_key, subtitles: false, reason: "no_words" });
       }
     }
@@ -814,7 +787,7 @@ app.post("/burn-subs", auth, async (req, res) => {
       outputFile,
     ]);
 
-    const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    const url = await uploadFile(outputFile, output_key, "video/mp4");
     uploadedFinal = true;
     const duration = await getDuration(outputFile);
 
@@ -827,7 +800,7 @@ app.post("/burn-subs", auth, async (req, res) => {
       res.status(500).json({ error: err.message });
     } else {
       try {
-        const url = await uploadToR2(videoFile, output_key, "video/mp4");
+        const url = await uploadFile(videoFile, output_key, "video/mp4");
         res.json({ url, output_key, subtitles: false, reason: err.message });
       } catch {
         res.status(500).json({ error: err.message });
@@ -901,7 +874,7 @@ app.post("/mix-background", auth, async (req, res) => {
       "-y", outputFile,
     ]);
 
-    const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    const url = await uploadFile(outputFile, output_key, "video/mp4");
     const duration = await getDuration(outputFile);
     res.json({ url, duration, output_key });
   } catch (err) {
@@ -949,7 +922,7 @@ app.post("/color-grade", auth, async (req, res) => {
       outputFile,
     ]);
 
-    const url = await uploadToR2(outputFile, output_key, "video/mp4");
+    const url = await uploadFile(outputFile, output_key, "video/mp4");
     const duration = await getDuration(outputFile);
     res.json({ url, duration, output_key, grade });
   } catch (err) {
@@ -994,7 +967,7 @@ app.post("/atempo", auth, async (req, res) => {
       "-b:a", "128k",
       outputFile,
     ]);
-    const url = await uploadToR2(outputFile, output_key, "audio/mpeg");
+    const url = await uploadFile(outputFile, output_key, "audio/mpeg");
     const duration = await getDuration(outputFile);
     res.json({ url, duration, output_key, applied_atempo: factor });
   } catch (err) {
@@ -1005,7 +978,7 @@ app.post("/atempo", auth, async (req, res) => {
 });
 
 // --- POST /extract-thumbnail ---
-// Extract a single JPG frame at `timestamp_sec` (default 1s), upload to R2.
+// Extract a single JPG frame at `timestamp_sec` (default 1s), upload to storage.
 // Returns thumbnail URL + source video width/height/duration so the caller
 // can derive aspect_ratio for creatives.
 
@@ -1040,7 +1013,7 @@ app.post("/extract-thumbnail", auth, async (req, res) => {
       thumbFile,
     ]);
 
-    const url = await uploadToR2(thumbFile, output_key, "image/jpeg");
+    const url = await uploadFile(thumbFile, output_key, "image/jpeg");
     res.json({ url, width: dims.width, height: dims.height, duration });
   } catch (err) {
     res.status(500).json({ error: err.message });
