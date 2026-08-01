@@ -6,10 +6,6 @@ The app calls it over HTTPS from Vercel, so **TLS is mandatory** — Node's `fet
 rejects a self-signed certificate, and Let's Encrypt does not issue certificates
 for a bare IP address.
 
-> The production code currently lives on the `stage1-supabase-storage` branch.
-> `main` is the older build that writes to Cloudflare R2 and hardcodes 720x1280 —
-> do not deploy it.
-
 Secrets are never committed. They live only in `/opt/ffmpeg-service/.env` (mode 600).
 
 ## Prerequisites
@@ -36,12 +32,12 @@ sudo npm install -g pm2
 Verify: `node -v` (≥ 20), `ffmpeg -version` (≥ 4.3 — `/merge` needs the `xfade` and
 `acrossfade` filters), `ffprobe -version`.
 
-## Step 2 — Clone the deployable branch
+## Step 2 — Clone the repository
 
 ```bash
 sudo mkdir -p /opt/ffmpeg-service
 sudo chown "$USER" /opt/ffmpeg-service
-git clone -b stage1-supabase-storage https://github.com/Cancemone/ffmpeg-service.git /opt/ffmpeg-service
+git clone https://github.com/Cancemone/ffmpeg-service.git /opt/ffmpeg-service
 cd /opt/ffmpeg-service
 npm ci --omit=dev
 npm test          # 22/22; uses node --test, no dev dependencies needed
@@ -174,5 +170,6 @@ Report to the app side:
 cd /opt/ffmpeg-service && git pull && npm ci --omit=dev && pm2 restart ffmpeg-service
 ```
 
-While the code lives on `stage1-supabase-storage`, `git pull` follows that branch.
-Once it is merged into `main`, switch with `git checkout main && git pull`.
+A VPS provisioned before the `stage1-supabase-storage` branch was merged still
+tracks that branch; move it onto `main` once with
+`git checkout main && git pull`.
