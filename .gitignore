@@ -1,1 +1,11 @@
 node_modules
+
+# Secrets — this repository is public. The real values live only in
+# /opt/ffmpeg-service/.env on the VPS.
+.env
+.env.*
+!.env.example
+
+# Agent scratch directories
+.omc/
+.superpowers/
