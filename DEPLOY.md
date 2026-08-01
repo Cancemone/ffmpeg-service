@@ -1,0 +1,178 @@
+# Deploying ffmpeg-service on a VPS
+
+This service is the video post-processing sidecar for
+[creative-studio](https://github.com/Cancemone/creative-studio) (Next.js on Vercel).
+The app calls it over HTTPS from Vercel, so **TLS is mandatory** — Node's `fetch`
+rejects a self-signed certificate, and Let's Encrypt does not issue certificates
+for a bare IP address.
+
+> The production code currently lives on the `stage1-supabase-storage` branch.
+> `main` is the older build that writes to Cloudflare R2 and hardcodes 720x1280 —
+> do not deploy it.
+
+Secrets are never committed. They live only in `/opt/ffmpeg-service/.env` (mode 600).
+
+## Prerequisites
+
+1. A hostname with an A record pointing at this VPS. A subdomain of an existing
+   domain is enough (`ffmpeg.example.com`). Without a domain, use a Cloudflare
+   Tunnel instead and skip steps 5–7.
+2. Supabase S3 access keys: Dashboard → Storage → Settings → S3 access keys →
+   *New access key*. The secret is displayed once — copy both halves immediately.
+3. Optional: `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` for the Workers AI
+   Whisper fallback in `/burn-subs`. Without them, subtitles depend entirely on the
+   word timings the app sends, and a run fails if they are missing.
+
+## Step 1 — Install the runtime
+
+```bash
+sudo apt update
+sudo apt install -y ffmpeg nginx git curl
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo npm install -g pm2
+```
+
+Verify: `node -v` (≥ 20), `ffmpeg -version` (≥ 4.3 — `/merge` needs the `xfade` and
+`acrossfade` filters), `ffprobe -version`.
+
+## Step 2 — Clone the deployable branch
+
+```bash
+sudo mkdir -p /opt/ffmpeg-service
+sudo chown "$USER" /opt/ffmpeg-service
+git clone -b stage1-supabase-storage https://github.com/Cancemone/ffmpeg-service.git /opt/ffmpeg-service
+cd /opt/ffmpeg-service
+npm ci --omit=dev
+npm test          # 22/22; uses node --test, no dev dependencies needed
+```
+
+## Step 3 — Write the environment file
+
+```bash
+cd /opt/ffmpeg-service
+cp .env.example .env
+openssl rand -hex 32     # this becomes AUTH_TOKEN — save it, the app needs the same value
+nano .env
+chmod 600 .env
+```
+
+Fill in `AUTH_TOKEN`, `STORAGE_ACCESS_KEY_ID`, `STORAGE_SECRET_ACCESS_KEY`.
+
+Everything else in `.env.example` is already correct and must not be changed:
+`STORAGE_PUBLIC_URL` has to match the app's `storageUrl()` byte for byte, because
+`keyFromUrl()` parses the returned URL back into an object key and the cleanup crons
+depend on that round-trip.
+
+Leave `ALLOWED_DOWNLOAD_HOSTS` **empty** — the service downloads clips straight from
+the Kling / kie CDNs, whose hostnames are provider-controlled and change without
+notice; an allowlist there silently breaks `/merge`. The private-IP block in
+`validation.js` is the SSRF safety net that actually matters.
+
+Keep `LISTEN_HOST=127.0.0.1` — nginx is the only thing facing the internet.
+
+## Step 4 — Start under pm2
+
+```bash
+cd /opt/ffmpeg-service
+pm2 start server.js --name ffmpeg-service
+pm2 save
+pm2 startup      # run the command it prints, then `pm2 save` again
+pm2 logs ffmpeg-service --lines 20
+```
+
+Expected: `ffmpeg-service listening on 127.0.0.1:3000`.
+A `FATAL: Missing required storage env vars: …` line means `.env` is incomplete —
+fix it and `pm2 restart ffmpeg-service`.
+
+## Step 5 — Configure nginx
+
+`/etc/nginx/sites-available/ffmpeg-service`:
+
+```nginx
+server {
+    listen 80;
+    server_name ffmpeg.example.com;   # replace with the real hostname
+
+    # Request bodies are tiny (clip URL lists, word timings); the service itself
+    # caps JSON at 64kb.
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # A single /merge of 7 clips can legitimately run for minutes, and the
+        # Vercel-side client waits up to 580s. Anything shorter here turns a slow
+        # render into a 504 that the caller records as a failed node.
+        proxy_connect_timeout 30s;
+        proxy_send_timeout    600s;
+        proxy_read_timeout    600s;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/ffmpeg-service /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+## Step 6 — Issue the TLS certificate
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d ffmpeg.example.com
+```
+
+## Step 7 — Open the firewall
+
+```bash
+sudo ufw allow 'Nginx Full'
+sudo ufw status
+```
+
+Port 3000 must NOT be exposed — the service binds to loopback by design.
+
+## Step 8 — Verify from outside the VPS
+
+```bash
+curl -s https://ffmpeg.example.com/health
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://ffmpeg.example.com/atempo \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+Expected: `{"status":"ok","ffmpeg":true}`, then `401`.
+
+## Step 9 — Smoke every endpoint
+
+Fixtures are synthetic media generated by ffmpeg itself, so no generation-provider
+credits are spent — this validates transport, auth, ffmpeg and storage only.
+
+```bash
+cd /opt/ffmpeg-service && node scripts/smoke.mjs
+```
+
+Expected: nine `PASS` lines and `All endpoints OK.`
+Then check Supabase Dashboard → Storage → `media`: no `runs/smoke-*` folder should
+remain (the script cleans up in its `finally` block).
+
+## Handing back
+
+Report to the app side:
+
+1. The final hostname (`https://…`) → Vercel env `FFMPEG_SERVICE_URL`.
+2. The generated `AUTH_TOKEN` → Vercel env `FFMPEG_SERVICE_TOKEN` (same value on
+   both sides; the app's `npx tsx scripts/check-ffmpeg.ts` verifies the pair).
+3. The `/health` output and the smoke result.
+
+## Updating later
+
+```bash
+cd /opt/ffmpeg-service && git pull && npm ci --omit=dev && pm2 restart ffmpeg-service
+```
+
+While the code lives on `stage1-supabase-storage`, `git pull` follows that branch.
+Once it is merged into `main`, switch with `git checkout main && git pull`.

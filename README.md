@@ -37,6 +37,8 @@ that round-trip.
 cd /opt/ffmpeg-service && git pull && npm ci --omit=dev && pm2 restart ffmpeg-service
 ```
 
+First-time provisioning of a VPS (runtime, nginx, TLS, pm2, smoke): [DEPLOY.md](DEPLOY.md).
+
 ## Local checks
 
 ```bash
