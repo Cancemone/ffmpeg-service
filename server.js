@@ -590,11 +590,6 @@ app.post("/burn-subs", auth, async (req, res) => {
   const audioTmp = tmpPath(".mp3");
   const outputFile = tmpPath(".mp4");
 
-  // Guards the catch-block fallback: once the burned-subs output has been
-  // uploaded to storage, a later error must NOT re-upload the raw source video
-  // over it (which would clobber the good output with an un-subtitled one).
-  let uploadedFinal = false;
-
   try {
     await download(video_url, videoFile);
 
@@ -664,24 +659,20 @@ app.post("/burn-subs", auth, async (req, res) => {
     ]);
 
     const url = await uploadFile(outputFile, output_key, "video/mp4");
-    uploadedFinal = true;
     const duration = await getDuration(outputFile);
 
     res.json({ url, duration, output_key, subtitles: true, style: styleKey, chunks: chunkCount });
   } catch (err) {
-    // Only fall back to raw-video upload if we never uploaded the burned-subs
-    // output. Otherwise a post-upload error (e.g. getDuration crash) would
-    // overwrite the good output with the un-subtitled source.
-    if (uploadedFinal) {
-      res.status(500).json({ error: err.message });
-    } else {
-      try {
-        const url = await uploadFile(videoFile, output_key, "video/mp4");
-        res.json({ url, output_key, subtitles: false, reason: err.message });
-      } catch {
-        res.status(500).json({ error: err.message });
-      }
-    }
+    // No raw-video fallback here, deliberately. The three `subtitles: false`
+    // returns above are the only cases this endpoint degrades gracefully for —
+    // each one is a *transcription* gap the caller can reason about. Everything
+    // that reaches this catch is a service fault: the download, ffprobe, the
+    // ASS build, the ffmpeg burn, or the upload itself. Answering those with
+    // `200 {subtitles: false}` plus an upload of the UN-SUBTITLED source wrote
+    // a broken asset to the caller's final output_key and made a service fault
+    // indistinguishable from a transcription gap. Fail loudly instead; the
+    // caller decides whether to retry.
+    res.status(500).json({ error: err.message });
   } finally {
     await cleanup(videoFile, assFile, audioTmp, outputFile);
   }

@@ -24,6 +24,13 @@ All POST, all require `Authorization: Bearer $AUTH_TOKEN`, all take an
 
 Dimensions default to 720x1280 (9:16) when `width`/`height` are omitted.
 
+`/burn-subs` returns `subtitles: false` (with the un-subtitled source uploaded
+under `output_key`) for exactly three transcription gaps: no Whisper
+credentials, the Whisper call failed, or Whisper returned no words. Every other
+failure — download, ffprobe, ASS build, the ffmpeg burn, the upload — is a 500.
+Shipping a service fault as a `200` wrote a broken asset to the caller's final
+key and hid the fault behind a legitimate-looking response.
+
 ## Storage
 
 Supabase Storage via its S3-compatible endpoint, bucket `media`, public read.
