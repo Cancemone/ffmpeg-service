@@ -115,6 +115,11 @@ const {
   hostAllowed,
 } = require("./validation");
 const { buildAssContent, STYLES } = require("./subtitles");
+const {
+  MERGE_TRANSITION_SEC,
+  OVERLAY_MAX_OVERFLOW_SEC,
+  overlayAudioOverflow,
+} = require("./audio-fit");
 
 const ALLOW_HTTP_DOWNLOADS = process.env.ALLOW_HTTP_DOWNLOADS === "true";
 const ALLOWED_DOWNLOAD_HOSTS = parseHostPatterns(process.env.ALLOWED_DOWNLOAD_HOSTS);
@@ -270,7 +275,6 @@ app.post("/overlay", auth, async (req, res) => {
 
   const videoFile = tmpPath(".mp4");
   const audioFile = tmpPath(".mp3");
-  const audioTrimmed = tmpPath(".mp3");
   const outputFile = tmpPath(".mp4");
 
   try {
@@ -284,24 +288,34 @@ app.post("/overlay", auth, async (req, res) => {
       getDuration(audioFile),
     ]);
 
-    let audioFinal = audioFile;
-
-    // Safety net: trim audio if longer than video (0.3s tolerance).
-    // After the 2026-05-28 TTS/VO rework, the Vercel-side bake guarantees
-    // audio ≤ video post-atempo before sending it here — this branch should
-    // not be hit in production runs. Kept defensively against legacy callers
-    // and to protect against a buggy atempo factor.
-    if (audioDur > videoDur + 0.3) {
-      await exec("ffmpeg", [
-        "-y", "-i", audioFile,
-        "-t", String(videoDur),
-        audioTrimmed,
-      ]);
-      audioFinal = audioTrimmed;
+    // The Vercel-side bake sizes the audio to the video before sending it here
+    // (atempo / TTS-speed re-bake / script adjust), so audio > video means that
+    // fit is wrong — and the `-t videoDur` below would cut the overrun off the
+    // END of the ad, which is where the CTA is. That used to happen silently:
+    // this endpoint trimmed to fit and answered 200, so a broken fit was
+    // indistinguishable from a correct one and nobody read the returned
+    // duration. Same policy as /burn-subs: a service-visible fault fails loudly
+    // and the caller decides whether to retry. Sub-tolerance slop is still
+    // absorbed by -t — see OVERLAY_MAX_OVERFLOW_SEC for why the line is there.
+    const fit = overlayAudioOverflow(audioDur, videoDur);
+    if (fit.exceedsTolerance) {
+      console.error(
+        `[overlay] audio overruns video by ${fit.overflowSec}s ` +
+        `(audio=${audioDur}s video=${videoDur}s tolerance=${OVERLAY_MAX_OVERFLOW_SEC}s) output_key=${output_key}`
+      );
+      return res.status(400).json({
+        error:
+          `audio is ${fit.overflowSec}s longer than the video ` +
+          `(audio ${audioDur}s vs video ${videoDur}s, tolerance ${OVERLAY_MAX_OVERFLOW_SEC}s). ` +
+          "Trimming it would cut the end of the ad — fit the audio before calling /overlay.",
+        audio_overflow_sec: fit.overflowSec,
+        audio_duration: audioDur,
+        video_duration: videoDur,
+      });
     }
 
     await exec("ffmpeg", [
-      "-y", "-i", videoFile, "-i", audioFinal,
+      "-y", "-i", videoFile, "-i", audioFile,
       // apad makes the audio stream infinite so a VO shorter than the
       // clip is padded with silence instead of cutting the video. The
       // output is then hard-bounded by -t to videoDur: relying on
@@ -323,7 +337,7 @@ app.post("/overlay", auth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   } finally {
-    await cleanup(videoFile, audioFile, audioTrimmed, outputFile);
+    await cleanup(videoFile, audioFile, outputFile);
   }
 });
 
@@ -353,7 +367,7 @@ app.post("/merge", auth, async (req, res) => {
   const dims = parseDimensions(req.body);
   if (dims.error) return res.status(400).json({ error: dims.error });
 
-  const TRANSITION = transition_duration || 0.4;
+  const TRANSITION = transition_duration || MERGE_TRANSITION_SEC;
   const clipFiles = clips.map(() => tmpPath(".mp4"));
   const normFiles = clips.map(() => tmpPath(".mp4"));
   const outputFile = tmpPath(".mp4");
@@ -423,6 +437,12 @@ app.post("/merge", auth, async (req, res) => {
       const videoFilters = [];
       const audioFilters = [];
 
+      // Each xfade starts the next clip TRANSITION seconds before the previous
+      // one ends, so the junctions OVERLAP and the output runs
+      // sum(durations) - TRANSITION * (n - 1) — shorter than the raw sum. The
+      // caller relies on that identity when it sizes the global VO mp3 (see
+      // mergedTimelineDuration in creative-studio); if this recurrence ever
+      // changes, that math has to change with it.
       for (let i = 0; i < n - 1; i++) {
         const offset = durations.slice(0, i + 1).reduce((a, b) => a + b, 0) - TRANSITION * (i + 1);
         const vIn = i === 0 ? "[0:v][1:v]" : `[v${i - 1}][${i + 1}:v]`;
