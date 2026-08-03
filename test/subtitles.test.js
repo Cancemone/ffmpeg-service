@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildAssContent, toAssTime, chunkWords } = require("../subtitles");
+const { buildAssContent, toAssTime, chunkWords, hasUsableWords } = require("../subtitles");
 
 const WORDS = [
   { word: "one", start: 0.0, end: 0.4 },
@@ -55,4 +55,35 @@ test("popup emits one dialogue line per word", () => {
 test("an unknown style falls back to bold_outline instead of throwing", () => {
   const { content } = buildAssContent("no_such_style", WORDS, { width: 720, height: 1280 });
   assert.ok(content.includes("Style: Default,Arial,48,"));
+});
+
+test("hasUsableWords accepts a well-formed timing list", () => {
+  assert.equal(hasUsableWords(WORDS), true);
+});
+
+// `if (!wordList)` let `[]` through because [] is truthy, and the length guard
+// sat inside the Whisper branch that was skipped — /burn-subs then answered
+// 200 {subtitles: true} over a subtitle-free ASS file.
+test("hasUsableWords treats an empty array as 'no words sent'", () => {
+  assert.equal(hasUsableWords([]), false);
+});
+
+test("hasUsableWords rejects values that are not a word list at all", () => {
+  for (const bad of [undefined, null, "one two three", 42, {}, { words: WORDS }]) {
+    assert.equal(hasUsableWords(bad), false, `${JSON.stringify(bad)} should be rejected`);
+  }
+});
+
+test("hasUsableWords rejects a list with any unusable entry", () => {
+  for (const bad of [
+    [...WORDS, { word: "six", start: 2.0 }],
+    [...WORDS, { word: "", start: 2.0, end: 2.4 }],
+    [...WORDS, { word: "six", start: "2.0", end: "2.4" }],
+    [...WORDS, { word: "six", start: NaN, end: 2.4 }],
+    [...WORDS, { word: "six", start: 2.4, end: 2.0 }],
+    [...WORDS, null],
+    ["six"],
+  ]) {
+    assert.equal(hasUsableWords(bad), false, `${JSON.stringify(bad)} should be rejected`);
+  }
 });

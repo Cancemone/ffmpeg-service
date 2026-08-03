@@ -125,6 +125,31 @@ function chunkWords(wordList, size) {
   return chunks;
 }
 
+// Does `words` from the request body describe subtitles we can actually burn?
+//
+// Everything downstream — chunkWords, toAssTime, the \kf centisecond maths —
+// assumes `{ word: string, start: number, end: number }`. A caller that sends
+// something else does not get partial subtitles, it gets an ASS file full of
+// `undefined` at time NaN burned permanently into the delivered video. So the
+// bar is all-or-nothing: one bad entry sends the whole request down the
+// transcription path, which either produces correct timings or reports
+// `subtitles: false` — both honest answers.
+function isUsableWord(w) {
+  return (
+    w !== null &&
+    typeof w === "object" &&
+    typeof w.word === "string" &&
+    w.word.length > 0 &&
+    Number.isFinite(w.start) &&
+    Number.isFinite(w.end) &&
+    w.end >= w.start
+  );
+}
+
+function hasUsableWords(words) {
+  return Array.isArray(words) && words.length > 0 && words.every(isUsableWord);
+}
+
 function buildAssContent(styleKey, wordList, dims) {
   const key = STYLES[styleKey] ? styleKey : "bold_outline";
   const { width, height } = dims;
@@ -176,4 +201,4 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   return { content: header + lines.join("\n") + "\n", chunkCount: lines.length };
 }
 
-module.exports = { buildAssContent, chunkWords, toAssTime, STYLES };
+module.exports = { buildAssContent, chunkWords, toAssTime, hasUsableWords, STYLES };

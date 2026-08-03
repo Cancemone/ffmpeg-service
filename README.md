@@ -23,6 +23,12 @@ All POST, all require `Authorization: Bearer $AUTH_TOKEN`, all take an
 | `/health` (GET, no auth) | — | `{status, ffmpeg}` |
 
 Dimensions default to 720x1280 (9:16) when `width`/`height` are omitted.
+`transition_duration` defaults to 0.4s and must be a number in `[0, 2]`.
+
+`output_key` must be `runs/<run-id>/<name>.<ext>` — one flat file inside one
+run's folder, extension in `mp4|mp3|jpg|jpeg|png|webp`. The bucket is shared
+with the app's personas, music and published creatives, and PutObject
+overwrites in place, so nothing outside `runs/` is writable from here.
 
 `/burn-subs` returns `subtitles: false` (with the un-subtitled source uploaded
 under `output_key`) for exactly three transcription gaps: no Whisper
@@ -30,6 +36,12 @@ credentials, the Whisper call failed, or Whisper returned no words. Every other
 failure — download, ffprobe, ASS build, the ffmpeg burn, the upload — is a 500.
 Shipping a service fault as a `200` wrote a broken asset to the caller's final
 key and hid the fault behind a legitimate-looking response.
+
+`words` is all-or-nothing: a list where every entry is
+`{word: string, start: number, end: number}` is burned as given; anything else
+(missing, `[]`, or one malformed entry) is treated as "no timings sent" and
+falls through to Whisper. A partially-usable list would burn `undefined` at
+time `NaN` permanently into the delivered video.
 
 ## Storage
 

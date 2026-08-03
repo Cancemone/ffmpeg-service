@@ -2,14 +2,12 @@ require("dotenv").config();
 const express = require("express");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
-const fs = require("fs");
-const fsp = fs.promises;
-const path = require("path");
-const os = require("os");
-const crypto = require("crypto");
+const fsp = require("fs").promises;
 const dns = require("dns").promises;
 const net = require("net");
 const { assertStorageEnv, uploadFile } = require("./storage");
+const { tmpPath, TMP_MAX_AGE_MS, sweepStaleTmpFiles } = require("./tmp-files");
+const { parseStreamCodecTypes, audioPresenceFromCodecTypes } = require("./probe");
 
 const execRaw = promisify(execFile);
 
@@ -85,9 +83,18 @@ try {
   process.exit(1);
 }
 
-function tmpPath(ext) {
-  return path.join(os.tmpdir(), `ff_${crypto.randomBytes(6).toString("hex")}${ext}`);
-}
+// Collect scratch files a previous process was killed before it could unlink
+// (see tmp-files.js). Fire-and-forget: startup must not wait on /tmp, and a
+// sweep that fails is not a reason to refuse to serve.
+sweepStaleTmpFiles()
+  .then((removed) => {
+    if (removed > 0) {
+      console.log(
+        `Swept ${removed} stale temp file(s) older than ${TMP_MAX_AGE_MS / 60_000} min`
+      );
+    }
+  })
+  .catch((err) => console.error(`Temp sweep failed: ${err.message}`));
 
 // --- SSRF protection ---
 //
@@ -109,17 +116,23 @@ function tmpPath(ext) {
 const {
   validateOutputKey,
   parseDimensions,
+  parseTransitionDuration,
   scaleAndPadFilter,
   isPrivateIp,
   parseHostPatterns,
   hostAllowed,
 } = require("./validation");
-const { buildAssContent, STYLES } = require("./subtitles");
+const { buildAssContent, hasUsableWords, STYLES } = require("./subtitles");
+// MERGE_TRANSITION_SEC is not imported here on purpose: /merge now takes its
+// transition through parseTransitionDuration, which owns the default.
+const { OVERLAY_MAX_OVERFLOW_SEC, overlayAudioOverflow } = require("./audio-fit");
 const {
-  MERGE_TRANSITION_SEC,
-  OVERLAY_MAX_OVERFLOW_SEC,
-  overlayAudioOverflow,
-} = require("./audio-fit");
+  MAX_DOWNLOAD_BYTES,
+  MERGE_DOWNLOAD_CONCURRENCY,
+  declaredTooLarge,
+  mapWithConcurrency,
+  streamToFile,
+} = require("./download-limits");
 
 const ALLOW_HTTP_DOWNLOADS = process.env.ALLOW_HTTP_DOWNLOADS === "true";
 const ALLOWED_DOWNLOAD_HOSTS = parseHostPatterns(process.env.ALLOWED_DOWNLOAD_HOSTS);
@@ -188,6 +201,9 @@ async function download(url, dest) {
     }
     if (res.status >= 300 && res.status < 400) {
       const next = res.headers.get("location");
+      // A redirect body is never read, on either exit. Drop it before moving on
+      // rather than leaving one abandoned per hop.
+      await res.body?.cancel().catch(() => {});
       if (!next) throw new Error(`Redirect ${res.status} without Location`);
       // Resolve relative Location against current URL.
       current = new URL(next, current).toString();
@@ -195,12 +211,34 @@ async function download(url, dest) {
     }
     break;
   }
+  const short = current.length > 120 ? current.slice(0, 120) + "…" : current;
+  // Every early exit below abandons a body we will never read. undici holds the
+  // connection until the 60s AbortSignal tears it down, so this self-heals — but
+  // /merge can be sitting on MAX_CLIPS_PER_MERGE of them at once, and cancelling
+  // is free.
   if (!res.ok) {
-    const short = current.length > 120 ? current.slice(0, 120) + "…" : current;
+    await res.body?.cancel().catch(() => {});
     throw new Error(`HTTP ${res.status} fetching ${short}`);
   }
-  const buf = Buffer.from(await res.arrayBuffer());
-  await fsp.writeFile(dest, buf);
+  if (declaredTooLarge(res.headers.get("content-length"))) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(
+      `Refusing ${short}: Content-Length ${res.headers.get("content-length")} exceeds ` +
+      `the ${MAX_DOWNLOAD_BYTES}-byte cap`
+    );
+  }
+  if (!res.body) throw new Error(`Empty response body fetching ${short}`);
+  // Stream to disk instead of res.arrayBuffer(). Buffering held the WHOLE body
+  // in RAM, and /merge ran up to MAX_CLIPS_PER_MERGE of these at once, so peak
+  // RSS was the sum of every clip — an OOM kill there takes the process down
+  // with every endpoint's `finally { cleanup }` still pending. The byte counter
+  // inside streamToFile is what actually enforces the cap; the Content-Length
+  // check above is only an early-out and is absent on chunked responses.
+  try {
+    await streamToFile(res.body, dest);
+  } catch (err) {
+    throw new Error(`Failed to save ${short}: ${err.message}`);
+  }
 }
 
 async function cleanup(...files) {
@@ -233,19 +271,27 @@ async function getVideoDimensions(filePath) {
   return { width: w, height: h };
 }
 
+// A probe that FAILS (unreadable file, ffprobe timeout, SIGKILL) is
+// deliberately left to throw: swallowing it as `false` made /mix-background
+// pick the music-only branch and deliver an ad with the voiceover dropped,
+// under a 200. A 500 the caller can retry is the correct answer to a service
+// fault.
+//
+// That only works if "no audio stream" and "the probe failed" are actually
+// distinguishable — see probe.js for why the `-select_streams a` form could not
+// tell them apart, and why this lists every stream instead.
 async function hasAudioStream(filePath) {
-  try {
-    const { stdout } = await exec("ffprobe", [
-      "-v", "quiet",
-      "-select_streams", "a",
-      "-show_entries", "stream=codec_type",
-      "-of", "csv=p=0",
-      filePath,
-    ]);
-    return stdout.trim().length > 0;
-  } catch {
-    return false;
+  const { stdout } = await exec("ffprobe", [
+    "-v", "quiet",
+    "-show_entries", "stream=codec_type",
+    "-of", "csv=p=0",
+    filePath,
+  ]);
+  const present = audioPresenceFromCodecTypes(parseStreamCodecTypes(stdout));
+  if (present === null) {
+    throw new Error(`ffprobe reported no streams at all for ${filePath}`);
   }
+  return present;
 }
 
 // --- Auth middleware ---
@@ -367,14 +413,21 @@ app.post("/merge", auth, async (req, res) => {
   const dims = parseDimensions(req.body);
   if (dims.error) return res.status(400).json({ error: dims.error });
 
-  const TRANSITION = transition_duration || MERGE_TRANSITION_SEC;
+  const transition = parseTransitionDuration(transition_duration);
+  if (transition.error) return res.status(400).json({ error: transition.error });
+  const TRANSITION = transition.transition;
   const clipFiles = clips.map(() => tmpPath(".mp4"));
   const normFiles = clips.map(() => tmpPath(".mp4"));
   const outputFile = tmpPath(".mp4");
 
   try {
-    // Download all clips
-    await Promise.all(clips.map((c, i) => download(c.url, clipFiles[i])));
+    // Download all clips, a few at a time. A flat Promise.all over all 30 URLs
+    // made peak usage the sum of every clip; the window keeps it flat in the
+    // clip count. It also settles whatever is in flight before surfacing a
+    // failure, so the `finally` below never unlinks a file still being written.
+    await mapWithConcurrency(clips, MERGE_DOWNLOAD_CONCURRENCY, (c, i) =>
+      download(c.url, clipFiles[i])
+    );
 
     // Check audio per clip. The pipeline mixes Kling clips (with VO) and
     // /still-to-clip outputs (silent) freely, so we cannot assume the first
@@ -448,12 +501,17 @@ app.post("/merge", auth, async (req, res) => {
         const vIn = i === 0 ? "[0:v][1:v]" : `[v${i - 1}][${i + 1}:v]`;
         const vOut = i === n - 2 ? "[v]" : `[v${i}]`;
 
-        videoFilters.push(`${vIn}xfade=transition=fadeblack:duration=${TRANSITION}:offset=${offset.toFixed(3)}${vOut}`);
+        // Fixed-point everywhere: a validated number can still stringify as
+        // `1e-7`, which ffmpeg reads as a malformed option rather than a tiny
+        // duration.
+        videoFilters.push(
+          `${vIn}xfade=transition=fadeblack:duration=${TRANSITION.toFixed(3)}:offset=${offset.toFixed(3)}${vOut}`
+        );
 
         if (anyHasAudio) {
           const aIn = i === 0 ? "[0:a][1:a]" : `[a${i - 1}][${i + 1}:a]`;
           const aOut = i === n - 2 ? "[a]" : `[a${i}]`;
-          audioFilters.push(`${aIn}acrossfade=d=${TRANSITION}${aOut}`);
+          audioFilters.push(`${aIn}acrossfade=d=${TRANSITION.toFixed(3)}${aOut}`);
         }
       }
 
@@ -592,8 +650,9 @@ app.post("/extract-audio", auth, async (req, res) => {
 //   glowing     — white text with colored neon glow (pink)
 //   popup       — word-by-word scale-in animation
 //
-// If `words` is not provided, the endpoint auto-transcribes via Cloudflare
-// Whisper. `language` defaults to "fr".
+// If `words` is missing — or is not a list of usable `{word,start,end}`
+// entries — the endpoint auto-transcribes via Cloudflare Whisper.
+// `language` defaults to "fr".
 
 app.post("/burn-subs", auth, async (req, res) => {
   const { video_url, words, output_key, language, style } = req.body;
@@ -615,8 +674,11 @@ app.post("/burn-subs", auth, async (req, res) => {
 
     let wordList = words;
 
-    // If no words provided, transcribe via Cloudflare Whisper
-    if (!wordList) {
+    // If no usable words were provided, transcribe via Cloudflare Whisper.
+    // `!wordList` is not the test: `[]` is truthy, so an empty array skipped
+    // this branch AND the length guard inside it, and the endpoint answered
+    // 200 {subtitles: true} over an ASS file with no Dialogue lines at all.
+    if (!hasUsableWords(wordList)) {
       const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
       const apiToken = process.env.CLOUDFLARE_API_TOKEN;
 
@@ -657,7 +719,9 @@ app.post("/burn-subs", auth, async (req, res) => {
       const whisperData = await whisperRes.json();
       wordList = whisperData.result?.words;
 
-      if (!wordList || wordList.length === 0) {
+      // Same bar as the caller-supplied list: a transcription we cannot turn
+      // into timed lines is a transcription gap, not a burn.
+      if (!hasUsableWords(wordList)) {
         const url = await uploadFile(videoFile, output_key, "video/mp4");
         return res.json({ url, output_key, subtitles: false, reason: "no_words" });
       }
@@ -665,6 +729,16 @@ app.post("/burn-subs", auth, async (req, res) => {
 
     const dims = await getVideoDimensions(videoFile);
     const { content: assContent, chunkCount } = buildAssContent(styleKey, wordList, dims);
+    // Belt and braces, not a live branch: hasUsableWords already guarantees a
+    // non-empty well-formed list on BOTH paths above, and buildAssContent emits
+    // at least one Dialogue line for any non-empty list in all five styles — so
+    // this is currently unreachable. It stays because the alternative failure is
+    // silent: an ASS file with zero Dialogue lines burns nothing, and uploading
+    // it under output_key hands the caller an un-subtitled video with
+    // `subtitles: true` on it. Delete it only together with that guarantee.
+    if (chunkCount === 0) {
+      throw new Error("Subtitle build produced no dialogue lines");
+    }
     await fsp.writeFile(assFile, assContent, "utf-8");
 
     await exec("ffmpeg", [

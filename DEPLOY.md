@@ -40,7 +40,7 @@ sudo chown "$USER" /opt/ffmpeg-service
 git clone https://github.com/Cancemone/ffmpeg-service.git /opt/ffmpeg-service
 cd /opt/ffmpeg-service
 npm ci --omit=dev
-npm test          # 22/22; uses node --test, no dev dependencies needed
+npm test          # all green; uses node --test, no dev dependencies needed
 ```
 
 ## Step 3 — Write the environment file
