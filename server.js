@@ -126,6 +126,7 @@ const { buildAssContent, hasUsableWords, STYLES } = require("./subtitles");
 // MERGE_TRANSITION_SEC is not imported here on purpose: /merge now takes its
 // transition through parseTransitionDuration, which owns the default.
 const { OVERLAY_MAX_OVERFLOW_SEC, overlayAudioOverflow } = require("./audio-fit");
+const { parseVersion, healthResponse } = require("./health");
 const {
   MAX_DOWNLOAD_BYTES,
   MERGE_DOWNLOAD_CONCURRENCY,
@@ -304,8 +305,45 @@ function auth(req, res, next) {
 
 // --- Health check ---
 
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", ffmpeg: true });
+// Cached so a per-minute uptime probe does not spawn two processes every tick,
+// but short enough that a broken deploy surfaces within a minute.
+const HEALTH_CACHE_MS = 60_000;
+const HEALTH_PROBE_TIMEOUT_MS = 2_000;
+let healthCache = null; // { at: number, result: { status, body } }
+
+async function probeVersion(cmd) {
+  try {
+    const { stdout } = await exec(cmd, ["-version"], {
+      timeout: HEALTH_PROBE_TIMEOUT_MS,
+    });
+    return parseVersion(stdout);
+  } catch {
+    // Missing binary, wrong PATH under pm2, or a hung process killed by the
+    // 2s timeout — all of them mean "cannot render", which is what /health is
+    // being asked.
+    return null;
+  }
+}
+
+app.get("/health", async (_req, res) => {
+  const now = Date.now();
+  if (healthCache && now - healthCache.at < HEALTH_CACHE_MS) {
+    return res.status(healthCache.result.status).json(healthCache.result.body);
+  }
+  const [ffmpeg, ffprobe] = await Promise.all([
+    probeVersion("ffmpeg"),
+    probeVersion("ffprobe"),
+  ]);
+  const result = healthResponse({ ffmpeg, ffprobe });
+  // Cache both outcomes: a degraded box that is being hammered by a monitor
+  // should not spawn processes it has just proven it cannot spawn.
+  healthCache = { at: now, result };
+  if (result.status !== 200) {
+    console.error(
+      `[health] degraded — ffmpeg=${ffmpeg ?? "MISSING"} ffprobe=${ffprobe ?? "MISSING"}`
+    );
+  }
+  res.status(result.status).json(result.body);
 });
 
 // --- POST /overlay ---

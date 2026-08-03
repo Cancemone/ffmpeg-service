@@ -140,7 +140,14 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://ffmpeg.example.com/atem
   -H 'Content-Type: application/json' -d '{}'
 ```
 
-Expected: `{"status":"ok","ffmpeg":true}`, then `401`.
+Expected: `{"status":"ok","ffmpeg":"<version>","ffprobe":"<version>"}` with HTTP
+200, then `401`.
+
+`/health` actually runs `ffmpeg -version` and `ffprobe -version` (2s timeout,
+result cached 60s). If either is missing or unreachable — a wrong PATH under pm2
+is the usual cause — it answers **503** with `{"status":"degraded"}` and names
+the binary that failed. Point uptime monitoring at the status code; a green
+`/health` now means the box can actually render.
 
 ## Step 9 — Smoke every endpoint
 
